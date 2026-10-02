@@ -1,27 +1,35 @@
-# StackPilot — AI code-to-deploy workspace
+# StackPilot — AI Build Studio
 
-A responsive, single-operator workspace that turns a pasted code dump into a project file tree, validates it, pushes it to GitHub, runs build/test checks in a temporary GitHub Actions runner, and can create or redeploy a Render service after checks pass.
+StackPilot turns a pasted code dump or brief into an editable project workspace, commits source to GitHub, runs real build/test checks, and can publish to Render only after GitHub checks pass. The iPhone-friendly PWA includes a live specialist progress view, job logs, project files, a live deployment preview, optional Web Push notifications, and a public UptimeRobot health endpoint.
 
-## Current architecture
+## How a build runs
 
-- **Claude / Anthropic** organizes a pasted dump and can attempt up to two targeted repairs from actual build logs. A key is required.
-- **GitHub** stores the durable source. A push is an atomic Git commit. StackPilot adds `.github/workflows/stackpilot-ci.yml` to run supported Node, Python, Go, Ruby, Elixir, or Rust checks on push.
-- **Remote shell** dispatches a command to a temporary GitHub-hosted Actions runner. It is not a shell process inside the Render web service. The runner does not receive StackPilot's stored keys; `actions/checkout` is configured with `persist-credentials: false`. GitHub Actions permissions and usage limits still apply.
-- **Render** service creation happens only after GitHub checks pass. StackPilot polls deployment status and Render logs, then shows the service URL. Render must already have access to the selected GitHub repository.
-- **Persistence**: unsent drafts and project metadata live in this browser's IndexedDB. GitHub is the durable, cross-device copy after a push. API keys are held in browser `sessionStorage` for the current session and forwarded only when an action is requested; the app does not write them to its project files.
-- **Preflight**: checks path safety, `package.json`, relative imports, and likely embedded credentials. Actual build/test is done remotely in GitHub Actions. No software can promise that every generated project is error-free; check the logs and preview before relying on a deployment.
+1. **Project Architect** uses Claude to organize a code dump (or resumes from saved files).
+2. **Safety & Build Guard** checks paths, likely secrets, imports, and basic project setup.
+3. **GitHub Release Agent** commits the project and CI workflow.
+4. **Build & Test Agent** watches the real GitHub Actions workflow.
+5. **Render Operator** starts only after the current GitHub build/test run succeeds, unless Auto-deploy is off.
+
+The background orchestration is server-side, so closing Safari does not cancel a job while the StackPilot service process stays up. GitHub Actions continues its own build independently after a commit. **Render Free is not a durable job-worker plan**: a service restart/redeploy can clear in-memory job progress and push subscriptions. UptimeRobot requests to `/health` can prevent idle spin-down when sent often enough, but cannot prevent maintenance/restarts or free-hour limits.
+
+## Security and storage
+
+- API credentials are never added to project files or commits.
+- The global GitHub PAT can be supplied in the browser session or saved as the private `GITHUB_TOKEN` environment variable from Settings. Its expiry date must be entered manually; GitHub does not return a PAT expiry date through the regular `/user` endpoint. StackPilot can remind you at 7, 3, 1, and 0 days when the date is configured.
+- Global `ANTHROPIC_API_KEY` and `RENDER_API_TOKEN` environment variables are optional. Otherwise, credentials are entered in Settings. Project-specific platform overrides and project runtime environment values are kept in browser session storage; runtime variables are sent to Render only when deploying.
+- Unsent projects are saved in this browser's IndexedDB. GitHub is the durable, cross-device source copy after push. Avoid clearing website data before pushing drafts.
+- `APP_PASSWORD` protects API routes. `/health` and `/api/health` are deliberately public for availability monitoring; they do not expose keys.
+- Web Push uses VAPID keys in the server environment. On iPhone, use Safari, add StackPilot to Home Screen, then enable Notifications from inside the installed app (iOS 16.4+).
 
 ## Run locally
 
 Requirements: Node.js 20+
 
 ```bash
-npm install
+npm ci
 cp .env.example .env
 npm run dev
 ```
-
-Open the URL printed by the server. The app listens on `0.0.0.0` so it can also be opened from another device on the same trusted network. Do not forward a local dev server to the public internet.
 
 For a production build:
 
@@ -30,33 +38,21 @@ npm run build
 NODE_ENV=production npm start
 ```
 
-## Deploy this app to Render
+## Deploy StackPilot to Render
 
-1. Create a new GitHub repository for **this StackPilot project** and push these files.
-2. In Render, create a Web Service from that repository. You can use the included `render.yaml` Blueprint or set:
-   - Build command: `npm install && npm run build`
-   - Start command: `npm start`
-   - Health check: `/api/health`
-   - Plan: Free (for a personal preview)
-3. Set a long, private `APP_PASSWORD` in Render. The included Blueprint asks Render to generate one; retrieve it from the service's Environment page and enter it under **Connectors** when you open StackPilot.
-4. Open the StackPilot URL, then add your Anthropic API key, GitHub token, and Render API key/workspace ID in **Connectors**.
-5. Link the GitHub account to Render in the Render dashboard before asking StackPilot to create a Render service from a private repo.
+1. Push this source to a GitHub repository.
+2. Create a Render Web Service from that repository (or use `render.yaml`).
+3. Configure a long private `APP_PASSWORD`. For the full features, also set `STACKPILOT_SERVICE_ID`, `RENDER_OWNER_ID`, and VAPID keys. Optional global credentials are `GITHUB_TOKEN`, `GITHUB_TOKEN_EXPIRES_AT` (`YYYY-MM-DD`), `ANTHROPIC_API_KEY`, and `RENDER_API_TOKEN`.
+4. Use `/health` as the service health check and UptimeRobot monitor target. It returns HTTP 200 with plain `ok`; `/api/health` returns JSON and is also public.
+5. Add to Home Screen in iOS Safari, then open the new icon and enable notifications.
 
-## Credentials needed
+## Integrations
 
-- **Anthropic**: an API key with access to the selected Claude model. Usage is billed by Anthropic.
-- **GitHub fine-grained token**: repository **Contents: read/write**, **Actions: read/write**, and **Metadata: read**. Add repository-creation permission if you want StackPilot to create repos automatically. Alternatively create a private repo yourself and enter `owner/repo`.
-- **Render**: a Render API key plus the workspace/owner ID. Render must be linked to the GitHub repository. Select Static Site or Web Service and review the build/start commands before release. Web services default to Frankfurt (editable in the workspace); static sites use Render's global CDN.
+- **Anthropic**: API key with access to the selected Claude model. Usage is billed by Anthropic.
+- **GitHub**: fine-grained PAT with Contents read/write, Actions read/write, and Metadata read. Add repository creation permission only if StackPilot should create repos. The repository can be entered as `owner/repo`.
+- **Render**: API key and workspace/owner ID. Render must already be linked to the selected GitHub repo. Per-project environment values are sent through the Render API and are not committed to GitHub.
+- **GitHub Actions shell**: runs a command on a temporary runner, not as a persistent shell inside Render. It can read the repository and access the network; run only trusted project code.
 
-Tokens are not saved in Render's environment by this app. They are stored only in the current browser session. Use a private device, keep `APP_PASSWORD` enabled on a public deployment, and revoke any key you accidentally expose.
+## Render Free caveats
 
-## Important Render Free limitations
-
-Render Free web services can spin down after 15 minutes without inbound traffic; local filesystem changes are lost on spin-down, restart, and redeploy. This is why drafts live in browser storage and source is pushed to GitHub. Free services are appropriate for demos and personal experiments, not a promise of always-on production hosting. See [Render's Free instance documentation](https://render.com/docs/free).
-
-## Notes
-
-- The app does not store project drafts on its server. On iOS, use Safari and avoid clearing website data; push projects to GitHub to access source from another device.
-- GitHub Actions is a temporary CI/shell runner, not a persistent interactive VM. Detailed job logs are available after GitHub archives the run; status is polled while the job runs. A shell command can read the checked-out repository and access the network, so run only source you trust; the runner is not an interactive production shell.
-- Never place production secrets in a code dump. Use environment variables configured on Render instead.
-- The `render.yaml` file is for deploying StackPilot itself. It does not create other user services until you trigger a pipeline from the UI.
+Free Web Services can spin down after 15 minutes without inbound requests and have ephemeral filesystems. UptimeRobot can ping `/health` to keep the service warm, but it does not provide durable storage or prevent host restarts. Free instance hours are shared across the workspace. See [Render Free instance documentation](https://render.com/docs/free).

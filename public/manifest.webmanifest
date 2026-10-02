@@ -1,0 +1,17 @@
+{
+  "name": "StackPilot — AI Build Studio",
+  "short_name": "StackPilot",
+  "description": "Turn a code dump into a tested, deployed project.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#f4f5fa",
+  "theme_color": "#f4f5fa",
+  "categories": ["developer", "productivity"],
+  "icons": [
+    { "src": "/stackpilot-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/stackpilot-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

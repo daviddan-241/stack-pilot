@@ -2,8 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, randomUUID } from 'node:crypto';
 import AdmZip from 'adm-zip';
+import webpush from 'web-push';
 import { containsPossibleSecret, validateRelativePath } from './src/safety.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,6 +13,19 @@ const PORT = Number(process.env.PORT || 3000);
 const BODY_LIMIT = '12mb';
 const GH_API = 'https://api.github.com';
 const RENDER_API = 'https://api.render.com/v1';
+const backgroundJobs = new Map();
+const pushSubscriptions = new Map();
+const notifiedExpiryDays = new Set();
+const JOB_RETENTION_MS = 12 * 60 * 60 * 1000;
+const MAX_JOB_LOGS = 300;
+const vapidConfigured = Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
+if (vapidConfigured) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:stackpilot@example.com',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY,
+  );
+}
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: BODY_LIMIT }));
@@ -44,9 +58,22 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     authRequired: Boolean(process.env.APP_PASSWORD),
     mode: process.env.NODE_ENV === 'production' ? 'cloud' : 'development',
-    persistence: 'browser-local-and-github',
+    persistence: 'browser-local-and-github-actions',
+    envConfigured: {
+      github: Boolean(process.env.GITHUB_TOKEN),
+      render: Boolean(process.env.RENDER_API_TOKEN),
+      anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+    },
+    renderOwnerId: process.env.RENDER_OWNER_ID || '',
+    notificationsConfigured: vapidConfigured,
+    githubTokenExpiresAt: process.env.GITHUB_TOKEN_EXPIRES_AT || '',
+    serviceId: process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || '',
+    uptimeUrl: '/api/health',
   });
 });
+
+app.get('/health', (_req, res) => res.status(200).type('text/plain').send('ok'));
+app.get('/uptime', (_req, res) => res.status(200).type('text/plain').send('ok'));
 
 function normalizeFiles(input, { maxFiles = 300, maxTotal = 3_000_000 } = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -113,7 +140,8 @@ function parseJsonResponse(text) {
 
 app.post('/api/organize', async (req, res, next) => {
   try {
-    const { input, projectName, apiKey, model } = req.body || {};
+    const { input, projectName, model } = req.body || {};
+    const apiKey = req.body?.apiKey || process.env.ANTHROPIC_API_KEY;
     if (typeof input !== 'string' || !input.trim()) throw httpError('Paste some code or a project brief first.');
     if (input.length > 100_000) throw httpError('That code dump is over 100,000 characters. Split it into smaller pieces first.');
     if (containsPossibleSecret(input)) throw httpError('This code dump appears to contain a live credential. Remove or rotate it before sending source to Claude.');
@@ -146,7 +174,8 @@ app.post('/api/organize', async (req, res, next) => {
 
 app.post('/api/repair', async (req, res, next) => {
   try {
-    const { files: originalFiles, errors, apiKey, model } = req.body || {};
+    const { files: originalFiles, errors, model } = req.body || {};
+    const apiKey = req.body?.apiKey || process.env.ANTHROPIC_API_KEY;
     const files = normalizeFiles(originalFiles);
     if (Object.values(files).some(containsPossibleSecret)) throw httpError('A project file appears to contain a live credential. Remove or rotate it before asking Claude to inspect these files.');
     if (!apiKey) throw httpError('Add your Anthropic key to run an automatic repair.');
@@ -255,12 +284,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Set up Node
         if: github.event_name == 'workflow_dispatch' || hashFiles('package.json') != ''
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
       - name: Set up Python
@@ -364,8 +393,8 @@ async function githubRequest(token, endpoint, options = {}) {
 
 app.post('/api/github/me', async (req, res, next) => {
   try {
-    const token = req.body?.token;
-    if (!token) throw httpError('Add a GitHub token first.');
+    const token = req.body?.token || process.env.GITHUB_TOKEN;
+    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
     const { data } = await githubRequest(token, '/user');
     res.json({ login: data.login, avatarUrl: data.avatar_url, htmlUrl: data.html_url });
   } catch (error) { next(error); }
@@ -373,8 +402,9 @@ app.post('/api/github/me', async (req, res, next) => {
 
 app.post('/api/github/push', async (req, res, next) => {
   try {
-    const { token, repository, branch, files: rawFiles, createIfMissing = true, isPrivate = true } = req.body || {};
-    if (!token) throw httpError('Add a GitHub token in Connectors first.');
+    const { repository, branch, files: rawFiles, createIfMissing = true, isPrivate = true } = req.body || {};
+    const token = req.body?.token || process.env.GITHUB_TOKEN;
+    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
     const { owner, repo } = parseGithubRepo(repository);
     const files = normalizeFiles(rawFiles);
     if (Object.values(files).some(containsPossibleSecret)) throw httpError('A project file appears to contain a live credential. Remove or rotate it before pushing to GitHub.');
@@ -470,8 +500,9 @@ app.post('/api/github/push', async (req, res, next) => {
 
 app.post('/api/github/dispatch', async (req, res, next) => {
   try {
-    const { token, repository, branch, command } = req.body || {};
-    if (!token) throw httpError('Add a GitHub token first.');
+    const { repository, branch, command } = req.body || {};
+    const token = req.body?.token || process.env.GITHUB_TOKEN;
+    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
     const { owner, repo } = parseGithubRepo(repository);
     const shellCommand = String(command || '').trim();
     if (!shellCommand) throw httpError('Enter a command to run.');
@@ -505,8 +536,9 @@ async function readGithubRunLogs(token, owner, repo, runId) {
 
 app.post('/api/github/runs', async (req, res, next) => {
   try {
-    const { token, repository, branch, since } = req.body || {};
-    if (!token) throw httpError('Add a GitHub token first.');
+    const { repository, branch, since } = req.body || {};
+    const token = req.body?.token || process.env.GITHUB_TOKEN;
+    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
     const { owner, repo } = parseGithubRepo(repository);
     const params = new URLSearchParams({ per_page: '15' });
     if (branch) params.set('branch', branch);
@@ -525,6 +557,18 @@ app.post('/api/github/runs', async (req, res, next) => {
     });
   } catch (error) { next(error); }
 });
+
+function normalizeRenderEnvVars(envVars, { protectOwnService = false } = {}) {
+  if (!Array.isArray(envVars) || envVars.length > 30) throw httpError('Supply up to 30 environment variables.');
+  const reserved = protectOwnService ? ['PORT', 'APP_PASSWORD', 'RENDER_API_TOKEN', 'GITHUB_TOKEN', 'GITHUB_TOKEN_EXPIRES_AT', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY', 'STACKPILOT_SERVICE_ID'] : ['PORT'];
+  const output = envVars.map((item) => ({ key: String(item?.key || '').trim(), value: String(item?.value ?? '') })).filter((item) => item.key);
+  for (const item of output) {
+    if (!/^[A-Z_][A-Z0-9_]{0,99}$/.test(item.key)) throw httpError(`Invalid environment variable name: ${item.key}`);
+    if (reserved.includes(item.key)) throw httpError(`${item.key} is reserved by Render or StackPilot.`);
+    if (item.value.length > 2000) throw httpError(`${item.key} exceeds the 2,000 character limit.`);
+  }
+  return output;
+}
 
 async function renderRequest(token, endpoint, options = {}) {
   const response = await fetch(`${RENDER_API}${endpoint}`, {
@@ -547,8 +591,8 @@ async function renderRequest(token, endpoint, options = {}) {
 
 app.post('/api/render/test', async (req, res, next) => {
   try {
-    const token = req.body?.token;
-    if (!token) throw httpError('Add a Render API key first.');
+    const token = req.body?.token || process.env.RENDER_API_TOKEN;
+    if (!token) throw httpError('Add a Render API key in Connectors or configure RENDER_API_TOKEN on the server.');
     const data = await renderRequest(token, '/services?limit=1');
     res.json({ ok: true, message: 'Render API key accepted.', visibleServices: Array.isArray(data) ? data.length : 0 });
   } catch (error) { next(error); }
@@ -557,16 +601,18 @@ app.post('/api/render/test', async (req, res, next) => {
 app.post('/api/render/create', async (req, res, next) => {
   try {
     const {
-      token, ownerId, repository, branch, name, serviceType = 'web_service', runtime = 'node', region = 'frankfurt',
+      repository, branch, name, serviceType = 'web_service', runtime = 'node', region = 'frankfurt',
       buildCommand, startCommand, publishPath = 'dist', rootDir = '', envVars = [],
     } = req.body || {};
-    if (!token) throw httpError('Add a Render API key in Connectors first.');
+    const ownerId = req.body?.ownerId || process.env.RENDER_OWNER_ID;
+    const token = req.body?.token || process.env.RENDER_API_TOKEN;
+    if (!token) throw httpError('Add a Render API key in Connectors or configure RENDER_API_TOKEN on the server.');
     if (!ownerId) throw httpError('Enter the Render workspace/owner ID in Connectors.');
     const { owner, repo } = parseGithubRepo(repository);
     const repoUrl = `https://github.com/${owner}/${repo}`;
     const serviceName = String(name || repo).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 55) || 'stackpilot-app';
     const isStatic = serviceType === 'static_site';
-    const safeEnv = Array.isArray(envVars) ? envVars.slice(0, 30).filter((item) => item?.key && typeof item.value === 'string').map(({ key, value }) => ({ key: String(key).slice(0, 100), value: String(value).slice(0, 2000) })) : [];
+    const safeEnv = normalizeRenderEnvVars(envVars);
     const payload = {
       type: isStatic ? 'static_site' : 'web_service',
       name: serviceName,
@@ -608,7 +654,8 @@ app.post('/api/render/create', async (req, res, next) => {
 
 app.post('/api/render/deploy', async (req, res, next) => {
   try {
-    const { token, serviceId, commitId, clearCache = false } = req.body || {};
+    const { serviceId, commitId, clearCache = false } = req.body || {};
+    const token = req.body?.token || process.env.RENDER_API_TOKEN;
     if (!token || !serviceId) throw httpError('A Render token and service ID are required.');
     const body = { clearCache: clearCache ? 'clear' : 'do_not_clear' };
     if (commitId) body.commitId = commitId;
@@ -619,7 +666,8 @@ app.post('/api/render/deploy', async (req, res, next) => {
 
 app.post('/api/render/status', async (req, res, next) => {
   try {
-    const { token, serviceId, deployId } = req.body || {};
+    const { serviceId, deployId } = req.body || {};
+    const token = req.body?.token || process.env.RENDER_API_TOKEN;
     if (!token || !serviceId) throw httpError('A Render token and service ID are required.');
     let deploy;
     if (deployId) {
@@ -646,7 +694,9 @@ app.post('/api/render/status', async (req, res, next) => {
 
 app.post('/api/render/logs', async (req, res, next) => {
   try {
-    const { token, ownerId, serviceId, since } = req.body || {};
+    const { serviceId, since } = req.body || {};
+    const ownerId = req.body?.ownerId || process.env.RENDER_OWNER_ID;
+    const token = req.body?.token || process.env.RENDER_API_TOKEN;
     if (!token || !ownerId || !serviceId) throw httpError('Render token, workspace ID, and service ID are required to load logs.');
     const start = since ? Math.floor(Date.parse(since) / 1000) : Math.floor(Date.now() / 1000) - 45 * 60;
     const params = new URLSearchParams({ ownerId, startTime: String(Number.isFinite(start) ? start : Math.floor(Date.now() / 1000) - 2700), direction: 'forward', limit: '100' });
@@ -664,6 +714,438 @@ app.post('/api/render/logs', async (req, res, next) => {
     res.json({ logs, hasMore: Boolean(data.hasMore) });
   } catch (error) { next(error); }
 });
+
+function appendJobLog(job, text, level = 'info', source = 'StackPilot') {
+  job.sequence += 1;
+  job.logs.push({ id: job.sequence, time: new Date().toISOString(), level, source, text: String(text).slice(0, 3000) });
+  if (job.logs.length > MAX_JOB_LOGS) job.logs.splice(0, job.logs.length - MAX_JOB_LOGS);
+  job.updatedAt = new Date().toISOString();
+}
+
+function patchJob(job, patch) {
+  job.patch = { ...(job.patch || {}), ...patch };
+  job.patchVersion += 1;
+  job.updatedAt = new Date().toISOString();
+}
+
+function jobProgress(job) {
+  if (job.status === 'live' || job.status === 'verified') return 100;
+  const weights = { organize: 16, preflight: 14, github: 22, runner: 25, render: 23 };
+  let value = 0;
+  for (const [key, weight] of Object.entries(weights)) {
+    const state = job.steps?.[key];
+    if (state === 'done') value += weight;
+    else if (state === 'running') value += weight * 0.35;
+    else if (state === 'error') return Math.max(5, Math.min(96, value + weight * 0.2));
+  }
+  return Math.round(Math.min(job.status === 'live' || job.status === 'verified' ? 100 : 96, value));
+}
+
+function publicJob(job, after = 0, sinceVersion = 0) {
+  return {
+    id: job.id,
+    projectId: job.projectId,
+    name: job.name,
+    status: job.status,
+    progress: jobProgress(job),
+    activeAgent: job.activeAgent,
+    steps: job.steps,
+    logs: job.logs.filter((entry) => entry.id > after),
+    sequence: job.sequence,
+    patch: sinceVersion < job.patchVersion ? job.patch : null,
+    patchVersion: job.patchVersion,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt || '',
+    error: job.error || '',
+    workflowUrl: job.workflowUrl || '',
+  };
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+async function internalPost(endpoint, payload) {
+  const headers = { 'content-type': 'application/json' };
+  if (process.env.APP_PASSWORD) headers['x-app-password'] = process.env.APP_PASSWORD;
+  const response = await fetch(`http://127.0.0.1:${PORT}${endpoint}`, {
+    method: 'POST', headers, body: JSON.stringify(payload || {}), signal: AbortSignal.timeout(120_000),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `${endpoint} returned HTTP ${response.status}.`);
+  return data;
+}
+
+function jobStep(job, id, status, source, message) {
+  job.steps[id] = status;
+  job.activeAgent = source || 'StackPilot';
+  if (message) appendJobLog(job, message, status === 'error' ? 'error' : 'info', source || 'StackPilot');
+  job.updatedAt = new Date().toISOString();
+}
+
+async function notifySubscriptions(projectId, notification) {
+  if (!vapidConfigured || !pushSubscriptions.size) return;
+  const payload = JSON.stringify({ ...notification, url: notification.url || '/' });
+  await Promise.all([...pushSubscriptions.entries()].map(async ([endpoint, entry]) => {
+    if (projectId && entry.projectId && entry.projectId !== projectId) return;
+    try { await webpush.sendNotification(entry.subscription, payload, { TTL: 3600 }); }
+    catch (error) {
+      if (error.statusCode === 404 || error.statusCode === 410) pushSubscriptions.delete(endpoint);
+      else console.warn('[push] delivery failed', error.statusCode || 'unknown');
+    }
+  }));
+}
+
+app.get('/api/push/public-key', (_req, res) => {
+  res.json({ enabled: vapidConfigured, publicKey: vapidConfigured ? process.env.VAPID_PUBLIC_KEY : '' });
+});
+
+app.post('/api/push/subscribe', (req, res, next) => {
+  try {
+    if (!vapidConfigured) throw httpError('Web Push is not configured on this server yet.', 503);
+    const { subscription, projectId = '' } = req.body || {};
+    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) throw httpError('A valid browser push subscription is required.');
+    if (pushSubscriptions.size >= 50 && !pushSubscriptions.has(subscription.endpoint)) throw httpError('This single-operator workspace has reached its 50-device notification limit.', 429);
+    pushSubscriptions.set(subscription.endpoint, { subscription, projectId: String(projectId).slice(0, 100) });
+    res.status(201).json({ ok: true, enabled: true });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/push/unsubscribe', (req, res) => {
+  const endpoint = String(req.body?.endpoint || '');
+  if (endpoint) pushSubscriptions.delete(endpoint);
+  res.json({ ok: true });
+});
+
+app.post('/api/render/env-vars', async (req, res, next) => {
+  try {
+    const { serviceId, envVars = [] } = req.body || {};
+    const token = req.body?.token || process.env.RENDER_API_TOKEN;
+    if (!token || !serviceId) throw httpError('A Render API key and service ID are required.');
+    const ownServiceId = process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || '';
+    const allowed = normalizeRenderEnvVars(envVars, { protectOwnService: Boolean(ownServiceId && serviceId === ownServiceId) });
+    const results = await Promise.all(allowed.map(({ key, value }) => renderRequest(token, `/services/${encodeURIComponent(serviceId)}/env-vars/${encodeURIComponent(key)}`, { method: 'PUT', body: JSON.stringify({ value }) })));
+    res.json({ ok: true, updated: results.length, message: 'Render environment variables saved. A deploy is required before the running service sees the new values.' });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/settings/github-token', async (req, res, next) => {
+  try {
+    const githubToken = String(req.body?.githubToken || '').trim();
+    const renderToken = req.body?.renderToken || process.env.RENDER_API_TOKEN;
+    const serviceId = process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || req.body?.serviceId;
+    const expiresAt = String(req.body?.expiresAt || '').trim();
+    if (!githubToken) throw httpError('Enter the new GitHub token.');
+    if (!renderToken) throw httpError('Add a Render API key in Connectors to save a token to the server environment.');
+    if (!serviceId) throw httpError('The StackPilot Render service ID is not configured.');
+    if (expiresAt && !/^\d{4}-\d{2}-\d{2}$/.test(expiresAt)) throw httpError('Token expiry must use the YYYY-MM-DD date format.');
+    const { data: user } = await githubRequest(githubToken, '/user');
+    await Promise.all([
+      renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/env-vars/GITHUB_TOKEN`, { method: 'PUT', body: JSON.stringify({ value: githubToken }) }),
+      renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/env-vars/GITHUB_TOKEN_EXPIRES_AT`, { method: 'PUT', body: JSON.stringify({ value: expiresAt }) }),
+    ]);
+    const deploy = await renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/deploys`, { method: 'POST', body: JSON.stringify({ clearCache: 'do_not_clear' }) });
+    res.json({ ok: true, login: user.login, expiresAt, deployId: deploy.id || '', message: 'GitHub token and reminder date saved as Render secrets. StackPilot will restart on the queued deploy.' });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/jobs', async (req, res, next) => {
+  try {
+    const input = req.body || {};
+    const project = input.project || {};
+    const projectId = String(project.id || '').slice(0, 100);
+    const name = String(project.name || 'New project').slice(0, 100);
+    if (!projectId) throw httpError('A project ID is required to start a background run.');
+    if ([...backgroundJobs.values()].some((job) => ['queued', 'running'].includes(job.status))) throw httpError('Another StackPilot background run is already active. Wait for it to finish first.', 409);
+    if (!String(project.repo || '').trim()) throw httpError('Enter the GitHub repository (owner/repo) first.');
+    const credentials = {
+      anthropicKey: String(input.credentials?.anthropicKey || process.env.ANTHROPIC_API_KEY || ''),
+      githubToken: String(input.credentials?.githubToken || process.env.GITHUB_TOKEN || ''),
+      renderToken: String(input.credentials?.renderToken || process.env.RENDER_API_TOKEN || ''),
+    };
+    if (!credentials.githubToken) throw httpError('Add a GitHub token in Settings or configure GITHUB_TOKEN on the server.');
+    const rawInput = typeof project.rawInput === 'string' ? project.rawInput : '';
+    const sourceFiles = project.files && typeof project.files === 'object' ? project.files : {};
+    if (!rawInput.trim() && !Object.keys(sourceFiles).length) throw httpError('Paste a code dump or add project files before starting.');
+    if (rawInput.length > 100_000) throw httpError('That code dump is over the 100,000 character limit.');
+    const jobId = randomUUID();
+    const job = {
+      id: jobId, projectId, name, status: 'queued', activeAgent: 'StackPilot orchestrator',
+      steps: { organize: 'idle', preflight: 'idle', github: 'idle', runner: 'idle', render: 'idle' },
+      logs: [], sequence: 0, patch: {}, patchVersion: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      workflowUrl: '', error: '',
+    };
+    backgroundJobs.set(jobId, job);
+    appendJobLog(job, 'Run accepted. StackPilot will keep working on the server if you leave this page.', 'info', 'Orchestrator');
+    const context = {
+      credentials,
+      project: {
+        id: projectId, name, slug: String(project.slug || name.toLowerCase().replace(/[^a-z0-9]+/g, '-')).slice(0, 60),
+        rawInput, files: sourceFiles, repo: String(project.repo || '').trim(), branch: String(project.branch || 'main').trim(),
+        renderServiceId: String(project.renderServiceId || ''), renderUrl: String(project.renderUrl || ''),
+        serviceType: project.serviceType === 'static_site' ? 'static_site' : 'web_service',
+        runtime: ['node', 'python', 'ruby', 'go', 'elixir'].includes(project.runtime) ? project.runtime : 'node',
+        region: String(project.region || 'frankfurt'), buildCommand: String(project.buildCommand || ''),
+        startCommand: String(project.startCommand || ''), publishPath: String(project.publishPath || 'dist'), rootDir: String(project.rootDir || ''),
+        summary: String(project.summary || ''), stack: String(project.stack || ''), autoDeploy: Boolean(project.autoDeploy),
+        envVars: Array.isArray(input.envVars) ? input.envVars : [],
+      },
+      ownerId: String(input.renderOwnerId || process.env.RENDER_OWNER_ID || ''), model: String(input.model || 'claude-sonnet-5-5'),
+    };
+    runBackgroundJob(job, context).catch((error) => console.error('[job] unhandled failure', error.message));
+    res.status(202).json({ jobId, status: job.status, projectId, message: 'Background run started.' });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/jobs/:jobId', (req, res) => {
+  const job = backgroundJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Background run not found. It may have expired or the server restarted.' });
+  const after = Math.max(0, Number(req.query.after) || 0);
+  const sinceVersion = Math.max(0, Number(req.query.sinceVersion) || 0);
+  res.json(publicJob(job, after, sinceVersion));
+});
+
+async function runBackgroundJob(job, ctx) {
+  const p = ctx.project;
+  const creds = ctx.credentials;
+  let files = { ...(p.files || {}) };
+  let repairs = 0;
+  try {
+    job.status = 'running';
+    jobStep(job, 'organize', p.rawInput.trim() ? 'running' : 'done', 'Project architect', p.rawInput.trim() ? 'Reading the dump and assembling a runnable project structure.' : 'Starting from the saved project files.');
+    if (p.rawInput.trim()) {
+      const organized = await internalPost('/api/organize', { input: p.rawInput, projectName: p.name, apiKey: creds.anthropicKey, model: ctx.model });
+      files = organized.files || {};
+      Object.assign(p, organized);
+      appendJobLog(job, `Project architect organized ${Object.keys(files).length} files · ${organized.stack || 'stack identified'}.`, 'success', 'Claude architect');
+      (organized.notes || []).forEach((note) => appendJobLog(job, note, 'warning', 'Project architect'));
+      patchJob(job, { files, activeFile: Object.keys(files).sort()[0] || '', summary: organized.summary || '', stack: organized.stack || '', serviceType: organized.deployType || p.serviceType, runtime: organized.runtime || p.runtime, buildCommand: organized.buildCommand || p.buildCommand, startCommand: organized.startCommand || p.startCommand, publishPath: organized.publishPath || p.publishPath, rawInput: p.rawInput });
+    } else appendJobLog(job, 'Using the current project file tree.', 'info', 'Project architect');
+    job.steps.organize = 'done';
+
+    while (true) {
+      jobStep(job, 'preflight', 'running', 'Safety & build guard', 'Checking file paths, likely secrets, imports, and project setup.');
+      const preflight = await internalPost('/api/validate', { files });
+      appendJobLog(job, `Preflight inspected ${preflight.files} files · ${preflight.findings.length} finding(s).`, preflight.ok ? 'success' : 'warning', 'Safety & build guard');
+      preflight.findings.forEach((finding) => appendJobLog(job, finding.message, finding.severity === 'error' ? 'error' : 'warning', 'Preflight'));
+      if (preflight.ok) { job.steps.preflight = 'done'; break; }
+      if (!creds.anthropicKey || repairs >= 2) throw new Error('Preflight found blocking issues. Add Claude in Settings or fix the files before retrying.');
+      const repair = await internalPost('/api/repair', { files, errors: preflight.findings.map((finding) => finding.message).join('\n'), apiKey: creds.anthropicKey, model: ctx.model });
+      files = { ...files, ...(repair.files || {}) };
+      repairs += 1;
+      appendJobLog(job, `${repair.summary || 'Applied a targeted preflight repair.'} (repair ${repairs}/2).`, 'warning', 'Repair agent');
+      patchJob(job, { files, activeFile: Object.keys(repair.files || {})[0] || Object.keys(files)[0] || '' });
+    }
+
+    while (true) {
+      jobStep(job, 'github', 'running', 'GitHub release agent', `Pushing ${Object.keys(files).length} checked files to ${p.repo}…`);
+      const captureAt = Date.now();
+      const pushed = await internalPost('/api/github/push', { token: creds.githubToken, repository: p.repo, branch: p.branch, files, createIfMissing: true, isPrivate: true });
+      p.repo = `${pushed.owner}/${pushed.repo}`;
+      p.branch = pushed.branch;
+      p.lastCommit = pushed.commitSha;
+      p.lastCommitUrl = pushed.commitUrl;
+      files = { ...files, [pushed.automationFilePath]: pushed.automationFileContent };
+      job.steps.github = 'done';
+      patchJob(job, { repo: p.repo, branch: p.branch, files, lastCommit: p.lastCommit, lastCommitUrl: p.lastCommitUrl, status: 'pushed' });
+      appendJobLog(job, `Committed ${pushed.fileCount} files (${pushed.commitSha.slice(0, 7)}). Waiting for real GitHub Actions checks.`, 'success', 'GitHub release agent');
+      jobStep(job, 'runner', 'running', 'Build & test agent', 'GitHub Actions is installing dependencies, running tests, and building the project.');
+      let runInfo = null;
+      for (let attempt = 0; attempt < 84; attempt += 1) {
+        runInfo = await internalPost('/api/github/runs', { token: creds.githubToken, repository: p.repo, branch: p.branch, since: new Date(captureAt).toISOString() });
+        if (runInfo.found) {
+          job.workflowUrl = runInfo.url || '';
+          if (runInfo.status !== job._lastRunStatus || runInfo.conclusion !== job._lastRunConclusion) {
+            job._lastRunStatus = runInfo.status;
+            job._lastRunConclusion = runInfo.conclusion;
+            appendJobLog(job, `GitHub Actions: ${runInfo.status}${runInfo.conclusion ? ` · ${runInfo.conclusion}` : ''}.`, runInfo.conclusion === 'failure' ? 'error' : 'info', 'Build & test agent');
+          }
+          if (runInfo.status === 'completed') break;
+        } else if (attempt >= 9) {
+          throw new Error('No GitHub Actions run appeared. Make sure Actions are enabled and this token can read workflow runs.');
+        } else if (attempt === 0) appendJobLog(job, 'Waiting for the GitHub-hosted runner to start…', 'info', 'Build & test agent');
+        await sleep(5000);
+      }
+      if (!runInfo?.found || runInfo.status !== 'completed') throw new Error('GitHub Actions is taking longer than seven minutes. Open the workflow link and retry after it finishes.');
+      if (runInfo.conclusion === 'success') {
+        job.steps.runner = 'done';
+        appendJobLog(job, 'Remote build and test workflow passed. Render will not be touched until this point.', 'success', 'Build & test agent');
+        break;
+      }
+      job.steps.runner = 'error';
+      if (!creds.anthropicKey || !runInfo.logs || repairs >= 2) throw new Error(runInfo.logs ? 'Remote build failed after the allowed repair attempts.' : 'Remote build failed; add Claude and verify GitHub Actions log access to enable auto-repair.');
+      repairs += 1;
+      appendJobLog(job, `The build failed. Repair agent is reviewing its real runner logs (${repairs}/2)…`, 'warning', 'Repair agent');
+      const repair = await internalPost('/api/repair', { files, errors: runInfo.logs, apiKey: creds.anthropicKey, model: ctx.model });
+      files = { ...files, ...(repair.files || {}) };
+      appendJobLog(job, repair.summary || 'Applied a build-log-guided repair.', 'warning', 'Repair agent');
+      patchJob(job, { files, activeFile: Object.keys(repair.files || {})[0] || Object.keys(files)[0] || '' });
+    }
+
+    if (!p.autoDeploy) {
+      job.status = 'verified';
+      job.activeAgent = 'Release gate';
+      patchJob(job, { status: 'verified', files, repo: p.repo, branch: p.branch, lastCommit: p.lastCommit, lastCommitUrl: p.lastCommitUrl });
+      appendJobLog(job, 'Automatic Render step is off. Everything is pushed and tested; use Deploy when you are ready.', 'success', 'Release gate');
+      return;
+    }
+    if (!creds.renderToken || !ctx.ownerId) {
+      job.status = 'verified';
+      patchJob(job, { status: 'verified', files, repo: p.repo, branch: p.branch, lastCommit: p.lastCommit, lastCommitUrl: p.lastCommitUrl });
+      appendJobLog(job, 'GitHub checks passed. Add a Render API key and workspace ID to start the deployment.', 'warning', 'Render operator');
+      return;
+    }
+
+    let serviceId = p.renderServiceId;
+    let deployId = '';
+    let renderSince = new Date().toISOString();
+    jobStep(job, 'render', 'running', 'Render operator', 'Starting Render only after all GitHub checks have passed.');
+    const envVars = Array.isArray(p.envVars) ? p.envVars : [];
+    if (!serviceId) {
+      const created = await internalPost('/api/render/create', {
+        token: creds.renderToken, ownerId: ctx.ownerId, repository: p.repo, branch: p.branch, name: p.slug,
+        serviceType: p.serviceType, runtime: p.runtime, region: p.region, buildCommand: p.buildCommand,
+        startCommand: p.startCommand, publishPath: p.publishPath, rootDir: p.rootDir, envVars,
+      });
+      serviceId = created.serviceId;
+      deployId = created.deployId;
+      p.renderUrl = created.url || '';
+      appendJobLog(job, `Render service created: ${serviceId}. Watching the live build now.`, 'success', 'Render operator');
+      patchJob(job, { renderServiceId: serviceId, renderUrl: p.renderUrl, renderDashboardUrl: created.dashboardUrl || '', renderDeployId: deployId, status: 'deploying' });
+    } else {
+      if (envVars.length) {
+        await internalPost('/api/render/env-vars', { token: creds.renderToken, serviceId, envVars });
+        appendJobLog(job, `Saved ${envVars.length} project environment variable(s) to Render.`, 'success', 'Render operator');
+      }
+      const queued = await internalPost('/api/render/deploy', { token: creds.renderToken, serviceId, commitId: p.lastCommit });
+      deployId = queued.deployId;
+      appendJobLog(job, `Render deploy queued for verified commit ${String(p.lastCommit || '').slice(0, 7)}.`, 'info', 'Render operator');
+      patchJob(job, { renderDeployId: deployId, status: 'deploying' });
+    }
+    renderSince = new Date().toISOString();
+    let renderOutcome = { ok: false };
+    for (let attempt = 0; attempt < 86; attempt += 1) {
+      const status = await internalPost('/api/render/status', { token: creds.renderToken, serviceId, deployId });
+      p.renderUrl = status.url || p.renderUrl;
+      if (status.status !== job._lastRenderStatus) {
+        job._lastRenderStatus = status.status;
+        appendJobLog(job, `Render deployment: ${String(status.status || 'unknown').replaceAll('_', ' ')}.`, ['build_failed', 'update_failed', 'pre_deploy_failed'].includes(status.status) ? 'error' : 'info', 'Render operator');
+      }
+      if (status.url) patchJob(job, { renderUrl: status.url, renderDashboardUrl: status.dashboardUrl || '', renderDeployId: status.deployId || deployId });
+      const logResponse = await internalPost('/api/render/logs', { token: creds.renderToken, ownerId: ctx.ownerId, serviceId, since: renderSince });
+      for (const line of (logResponse.logs || []).slice(-25)) {
+        const fingerprint = `${line.time}|${line.type}|${line.message}`;
+        if (job._renderLogFingerprints?.has(fingerprint)) continue;
+        job._renderLogFingerprints ||= new Set();
+        job._renderLogFingerprints.add(fingerprint);
+        appendJobLog(job, line.message, /error|fatal/i.test(`${line.level} ${line.message}`) ? 'error' : 'info', `Render ${line.type || 'log'}`);
+      }
+      if (status.status === 'live') { renderOutcome = { ok: true, info: status }; break; }
+      if (['build_failed', 'update_failed', 'pre_deploy_failed', 'canceled', 'deactivated'].includes(status.status)) { renderOutcome = { ok: false, logs: job.logs.slice(-120).map((line) => line.text).join('\n') }; break; }
+      await sleep(7000);
+    }
+    while (!renderOutcome.ok && repairs < 2 && creds.anthropicKey && renderOutcome.logs) {
+      repairs += 1;
+      appendJobLog(job, `Render failed. Repair agent is reviewing the deployment log (${repairs}/2)…`, 'warning', 'Repair agent');
+      const repair = await internalPost('/api/repair', { files, errors: renderOutcome.logs.slice(-45_000), apiKey: creds.anthropicKey, model: ctx.model });
+      files = { ...files, ...(repair.files || {}) };
+      patchJob(job, { files, activeFile: Object.keys(repair.files || {})[0] || Object.keys(files)[0] || '' });
+      appendJobLog(job, repair.summary || 'Applied a Render-log-guided repair.', 'warning', 'Repair agent');
+      const captureAt = Date.now();
+      const pushed = await internalPost('/api/github/push', { token: creds.githubToken, repository: p.repo, branch: p.branch, files, createIfMissing: false, isPrivate: true });
+      p.lastCommit = pushed.commitSha;
+      p.lastCommitUrl = pushed.commitUrl;
+      p.branch = pushed.branch;
+      files = { ...files, [pushed.automationFilePath]: pushed.automationFileContent };
+      patchJob(job, { files, lastCommit: p.lastCommit, lastCommitUrl: p.lastCommitUrl, branch: p.branch });
+      appendJobLog(job, `Pushed repair ${repairs}/2. Waiting for GitHub checks again before another Render deploy.`, 'success', 'GitHub release agent');
+      const runInfo = await waitForJobGithub(job, p, creds.githubToken, captureAt);
+      if (runInfo.conclusion !== 'success') { renderOutcome = { ok: false, logs: runInfo.logs || 'GitHub checks did not pass after the repair.' }; break; }
+      await internalPost('/api/render/env-vars', { token: creds.renderToken, serviceId, envVars });
+      const queued = await internalPost('/api/render/deploy', { token: creds.renderToken, serviceId, commitId: p.lastCommit });
+      deployId = queued.deployId;
+      renderSince = new Date().toISOString();
+      appendJobLog(job, `Retry deployment ${repairs}/2 queued after successful GitHub checks.`, 'info', 'Render operator');
+      renderOutcome = await waitForJobRender(job, { ...ctx, project: p }, creds.renderToken, serviceId, deployId, renderSince);
+    }
+    if (!renderOutcome.ok) throw new Error('GitHub checks passed, but Render did not reach Live. Review the live logs and retry.');
+    job.steps.render = 'done';
+    job.status = 'live';
+    job.activeAgent = 'Render operator';
+    patchJob(job, { files, repo: p.repo, branch: p.branch, lastCommit: p.lastCommit, lastCommitUrl: p.lastCommitUrl, renderServiceId: serviceId, renderUrl: renderOutcome.info.url || p.renderUrl, renderDashboardUrl: renderOutcome.info.dashboardUrl || '', renderDeployId: renderOutcome.info.deployId || deployId, status: 'live' });
+    appendJobLog(job, `Live on Render: ${renderOutcome.info.url || p.renderUrl || 'deployment completed'}.`, 'success', 'Render operator');
+    await notifySubscriptions(job.projectId, { title: 'StackPilot build is live', body: `${job.name} passed checks and is now deployed.`, url: renderOutcome.info.url || p.renderUrl || '/' });
+  } catch (error) {
+    job.status = 'failed';
+    job.error = error.message || 'Background run failed.';
+    job.activeAgent = 'Needs attention';
+    for (const key of Object.keys(job.steps)) if (job.steps[key] === 'running') job.steps[key] = 'error';
+    appendJobLog(job, job.error, 'error', 'StackPilot');
+    patchJob(job, { status: 'needs_attention', files, error: job.error });
+    await notifySubscriptions(job.projectId, { title: 'StackPilot needs your attention', body: `${job.name}: ${job.error}`, url: '/' });
+  } finally {
+    job.completedAt = new Date().toISOString();
+    job.updatedAt = new Date().toISOString();
+    ctx.credentials.anthropicKey = '';
+    ctx.credentials.githubToken = '';
+    ctx.credentials.renderToken = '';
+    ctx.project.rawInput = '';
+    ctx.project.files = {};
+    ctx.project.envVars = [];
+    if (job.status === 'running') job.status = 'failed';
+    setTimeout(() => backgroundJobs.delete(job.id), JOB_RETENTION_MS).unref?.();
+  }
+}
+
+async function waitForJobGithub(job, project, token, captureAt) {
+  for (let attempt = 0; attempt < 84; attempt += 1) {
+    const info = await internalPost('/api/github/runs', { token, repository: project.repo, branch: project.branch || 'main', since: new Date(captureAt).toISOString() });
+    if (info.found) {
+      job.workflowUrl = info.url || '';
+      if (info.status === 'completed') {
+        if (info.conclusion === 'success') job.steps.runner = 'done';
+        return info;
+      }
+      if (attempt % 6 === 0) appendJobLog(job, `GitHub repair check is ${info.status}.`, 'info', 'Build & test agent');
+    } else if (attempt >= 9) throw new Error('No GitHub Actions run appeared for the repair commit.');
+    await sleep(5000);
+  }
+  throw new Error('GitHub Actions is taking longer than seven minutes after the repair.');
+}
+
+async function waitForJobRender(job, ctx, token, serviceId, deployId, since) {
+  const unique = job._renderLogFingerprints || new Set();
+  for (let attempt = 0; attempt < 86; attempt += 1) {
+    const status = await internalPost('/api/render/status', { token, serviceId, deployId });
+    if (status.status !== job._lastRenderStatus) {
+      job._lastRenderStatus = status.status;
+      appendJobLog(job, `Render deployment: ${String(status.status || 'unknown').replaceAll('_', ' ')}.`, ['build_failed', 'update_failed', 'pre_deploy_failed'].includes(status.status) ? 'error' : 'info', 'Render operator');
+    }
+    const logs = await internalPost('/api/render/logs', { token, ownerId: ctx.ownerId, serviceId, since });
+    for (const line of (logs.logs || []).slice(-25)) {
+      const fingerprint = `${line.time}|${line.type}|${line.message}`;
+      if (unique.has(fingerprint)) continue;
+      unique.add(fingerprint);
+      appendJobLog(job, line.message, /error|fatal/i.test(`${line.level} ${line.message}`) ? 'error' : 'info', `Render ${line.type || 'log'}`);
+    }
+    if (status.url) patchJob(job, { renderUrl: status.url, renderDashboardUrl: status.dashboardUrl || '', renderDeployId: status.deployId || deployId });
+    if (status.status === 'live') return { ok: true, info: status };
+    if (['build_failed', 'update_failed', 'pre_deploy_failed', 'canceled', 'deactivated'].includes(status.status)) return { ok: false, logs: job.logs.slice(-120).map((line) => line.text).join('\n') };
+    await sleep(7000);
+  }
+  return { ok: false, logs: job.logs.slice(-120).map((line) => line.text).join('\n') };
+}
+
+if (process.env.GITHUB_TOKEN_EXPIRES_AT) {
+  const expiryTimer = setInterval(async () => {
+    const date = new Date(`${process.env.GITHUB_TOKEN_EXPIRES_AT}T23:59:59Z`);
+    if (Number.isNaN(date.getTime())) return;
+    const daysLeft = Math.ceil((date.getTime() - Date.now()) / 86_400_000);
+    if (![7, 3, 1, 0].includes(daysLeft) || notifiedExpiryDays.has(daysLeft)) return;
+    notifiedExpiryDays.add(daysLeft);
+    await notifySubscriptions('', { title: daysLeft === 0 ? 'GitHub token expires today' : `GitHub token expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`, body: 'Open StackPilot Settings to rotate the token before your next push.', url: '/' });
+  }, 60 * 60 * 1000);
+  expiryTimer.unref?.();
+}
 
 app.use('/api', (error, _req, res, _next) => {
   const status = Number(error.status) || 500;
