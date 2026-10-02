@@ -5,13 +5,17 @@ import {
   Clipboard, Cloud, Code2, Copy, ExternalLink, Eye, File, FileCode2, Folder,
   Github, Globe, HardDrive, KeyRound, Loader2, LockKeyhole, Menu, Monitor,
   Plus, Radio, Rocket, Save, Search, Settings2, ShieldCheck, Smartphone, Sparkles,
-  Terminal, Trash2, X, Zap,
+  Terminal, Trash2, Download, FileArchive, GitBranch, Timer, Wifi, X, Zap,
 } from 'lucide-react';
 import { createProjectId, getProjects, removeProject, saveProject } from './storage.js';
 import { STEPS, calculateProgress, detectEnvKeys } from './workflow.js';
+import { extractProjectZip } from './zipImport.js';
+import { normalizeMonitorUrl } from './monitor.js';
+import { binaryAssetByteLength, binaryAssetDataUri, isBinaryAsset, parseBinaryAsset } from './projectFiles.js';
 
 const SECRET_KEYS = {
-  anthropicKey: 'stackpilot.anthropic.session',
+  openRouterKey1: 'stackpilot.openrouter.1.session',
+  openRouterKey2: 'stackpilot.openrouter.2.session',
   githubToken: 'stackpilot.github.session',
   renderToken: 'stackpilot.render.session',
   appPassword: 'stackpilot.password.session',
@@ -58,7 +62,7 @@ function statusLabel(status) {
 }
 function fileLanguage(filePath = '') {
   const ext = filePath.split('.').pop()?.toLowerCase();
-  return ({ js: 'JavaScript', jsx: 'React JSX', ts: 'TypeScript', tsx: 'React TSX', html: 'HTML', css: 'CSS', json: 'JSON', md: 'Markdown', py: 'Python', yml: 'YAML', yaml: 'YAML', go: 'Go', sh: 'Shell', env: 'Environment' })[ext] || 'Text';
+  return ({ js: 'JavaScript', jsx: 'React JSX', ts: 'TypeScript', tsx: 'React TSX', html: 'HTML', css: 'CSS', json: 'JSON', md: 'Markdown', py: 'Python', yml: 'YAML', yaml: 'YAML', go: 'Go', sh: 'Shell', env: 'Environment', png: 'Binary image', jpg: 'Binary image', jpeg: 'Binary image', gif: 'Binary image', webp: 'Binary image', avif: 'Binary image', ico: 'Binary image', woff: 'Binary font', woff2: 'Binary font', ttf: 'Binary font', otf: 'Binary font', pdf: 'PDF asset', mp3: 'Audio asset', wav: 'Audio asset', mp4: 'Video asset', webm: 'Video asset' })[ext] || 'Text';
 }
 function fileIconFor(path) {
   if (path.endsWith('.json')) return Braces;
@@ -68,6 +72,13 @@ function fileIconFor(path) {
 }
 function parseVault(projectId) { return readJsonSession(`${PROJECT_VAULT_PREFIX}${projectId}`, {}); }
 function parseProjectEnv(projectId) { return readJsonSession(`${PROJECT_ENV_PREFIX}${projectId}`, []); }
+function readMonitors() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('stackpilot.uptime.monitors') || 'null');
+    if (Array.isArray(saved)) return saved.slice(0, 30);
+  } catch { /* local storage may be disabled */ }
+  return [{ id: 'stackpilot-main', name: 'StackPilot', url: `${typeof window !== 'undefined' ? window.location.origin : 'https://stack-pilot-builder.onrender.com'}/health`, intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' }];
+}
 function saveProjectEnvSession(projectId, rows) {
   try { sessionStorage.setItem(`${PROJECT_ENV_PREFIX}${projectId}`, JSON.stringify(rows)); } catch { /* session-only by design */ }
 }
@@ -82,24 +93,36 @@ function App() {
   const [activeId, setActiveId] = useState('');
   const [loading, setLoading] = useState(true);
   const [connectors, setConnectors] = useState(() => ({
-    anthropicKey: readSession(SECRET_KEYS.anthropicKey), githubToken: readSession(SECRET_KEYS.githubToken),
-    renderToken: readSession(SECRET_KEYS.renderToken), appPassword: readSession(SECRET_KEYS.appPassword),
-    renderOwnerId: readSession(SECRET_KEYS.renderOwnerId),
+    openRouterKey1: readSession(SECRET_KEYS.openRouterKey1), openRouterKey2: readSession(SECRET_KEYS.openRouterKey2),
+    githubToken: readSession(SECRET_KEYS.githubToken), renderToken: readSession(SECRET_KEYS.renderToken),
+    appPassword: readSession(SECRET_KEYS.appPassword), renderOwnerId: readSession(SECRET_KEYS.renderOwnerId),
   }));
-  const [health, setHealth] = useState({ authRequired: false, envConfigured: {} });
+  const [health, setHealth] = useState({ authRequired: false, appPinRequired: false, envConfigured: {} });
   const [page, setPage] = useState('start');
   const [workspaceTab, setWorkspaceTab] = useState('build');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toastList, setToastList] = useState([]);
   const [checkingGithub, setCheckingGithub] = useState(false);
   const [checkingRender, setCheckingRender] = useState(false);
+  const [checkingOpenRouter, setCheckingOpenRouter] = useState(false);
+  const [savingOpenRouter, setSavingOpenRouter] = useState(false);
+  const [savingAppPin, setSavingAppPin] = useState(false);
   const [shellCommand, setShellCommand] = useState('npm run build');
   const [shellBusy, setShellBusy] = useState(false);
   const [githubIdentity, setGithubIdentity] = useState('');
+  const [startSourceMode, setStartSourceMode] = useState('code');
   const [startInput, setStartInput] = useState('');
+  const [startFiles, setStartFiles] = useState({});
+  const [zipFilename, setZipFilename] = useState('');
+  const [zipBusy, setZipBusy] = useState(false);
   const [startRepo, setStartRepo] = useState('');
+  const [startBranch, setStartBranch] = useState('');
   const [startName, setStartName] = useState('');
   const [startAutoDeploy, setStartAutoDeploy] = useState(true);
+  const [importingGithub, setImportingGithub] = useState(false);
+  const [monitors, setMonitors] = useState(() => readMonitors());
+  const monitorsRef = useRef(monitors);
+  const checkingMonitors = useRef(new Set());
   const [editorDraft, setEditorDraft] = useState('');
   const [editorDirty, setEditorDirty] = useState(false);
   const [search, setSearch] = useState('');
@@ -128,7 +151,7 @@ function App() {
   const activeJobs = useMemo(() => projects.filter((project) => project.jobId && ['queued', 'running', 'deploying'].includes(project.status)), [projects]);
   const activeJobSignature = activeJobs.map((project) => `${project.id}:${project.jobId}`).join('|');
   const appBusy = activeJobs.length > 0;
-  const connectorCount = [connectors.anthropicKey || health.envConfigured?.anthropic, connectors.githubToken || health.envConfigured?.github, connectors.renderToken || health.envConfigured?.render].filter(Boolean).length;
+  const connectorCount = [connectors.openRouterKey1 || connectors.openRouterKey2 || health.envConfigured?.openrouter, connectors.githubToken || health.envConfigured?.github, connectors.renderToken || health.envConfigured?.render].filter(Boolean).length;
 
   const api = useCallback(async (url, payload, method = 'POST') => {
     const headers = { 'content-type': 'application/json' };
@@ -168,6 +191,74 @@ function App() {
     setEnvVersion((value) => value + 1);
   }, []);
 
+  const pingMonitor = useCallback(async (id) => {
+    const monitor = monitorsRef.current.find((item) => item.id === id);
+    if (!monitor || checkingMonitors.current.has(id)) return;
+    checkingMonitors.current.add(id);
+    setMonitors((rows) => rows.map((item) => item.id === id ? { ...item, checking: true } : item));
+    try {
+      const result = await api('/api/monitor/ping', { url: monitor.url });
+      const check = { ok: Boolean(result.ok), statusCode: Number(result.statusCode) || 0, durationMs: Number(result.durationMs) || 0, checkedAt: result.checkedAt || new Date().toISOString(), error: String(result.error || '') };
+      const wasUp = monitor.status === 'up';
+      setMonitors((rows) => rows.map((item) => item.id === id ? { ...item, checking: false, status: check.ok ? 'up' : 'down', lastCheckedAt: check.checkedAt, responseMs: check.durationMs, checks: [...(item.checks || []), check].slice(-240) } : item));
+      if (!check.ok && wasUp) {
+        showToast(`${monitor.name} is down (${check.error || `HTTP ${check.statusCode}`}).`, 'error');
+        if ('Notification' in window && Notification.permission === 'granted') navigator.serviceWorker?.ready.then((registration) => registration.showNotification(`${monitor.name} is down`, { body: check.error || `HTTP ${check.statusCode}`, icon: '/stackpilot-icon.png' })).catch(() => {});
+      }
+      return check;
+    } catch (error) {
+      const check = { ok: false, statusCode: 0, durationMs: 0, checkedAt: new Date().toISOString(), error: error.message || 'Monitor check failed.' };
+      setMonitors((rows) => rows.map((item) => item.id === id ? { ...item, checking: false, status: 'down', lastCheckedAt: check.checkedAt, responseMs: 0, checks: [...(item.checks || []), check].slice(-240) } : item));
+      return check;
+    } finally { checkingMonitors.current.delete(id); }
+  }, [api, showToast]);
+
+  const addMonitor = (value, name = '') => {
+    let url;
+    try { url = normalizeMonitorUrl(value); }
+    catch (error) { showToast(error.message || 'Enter a public HTTP(S) URL.', 'error'); return; }
+    if (monitorsRef.current.some((item) => item.url === url)) { showToast('That URL is already being monitored.'); return; }
+    if (monitorsRef.current.length >= 30) { showToast('Keep at most 30 monitor URLs on this device.', 'error'); return; }
+    const monitor = { id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, name: name.trim() || new URL(url).hostname, url, intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' };
+    setMonitors((rows) => [monitor, ...rows]);
+    window.setTimeout(() => pingMonitor(monitor.id), 50);
+    showToast('Monitor added. Checks run while this app is open and visible.', 'success');
+  };
+
+  const removeMonitor = (id) => setMonitors((rows) => rows.filter((item) => item.id !== id));
+
+  useEffect(() => { monitorsRef.current = monitors; try { localStorage.setItem('stackpilot.uptime.monitors', JSON.stringify(monitors)); } catch { /* local storage may be disabled */ } }, [monitors]);
+
+  useEffect(() => {
+    if (health.authRequired && !connectors.appPassword) return undefined;
+    const poll = () => {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      monitorsRef.current.forEach((item) => {
+        if (checkingMonitors.current.has(item.id)) return;
+        const last = Date.parse(item.lastCheckedAt || item.checks?.at(-1)?.checkedAt || '');
+        const interval = Math.max(60, Math.min(3600, Number(item.intervalSec) || 60)) * 1000;
+        if (!Number.isFinite(last) || now - last >= interval) pingMonitor(item.id);
+      });
+    };
+    poll();
+    const timer = window.setInterval(poll, 15_000);
+    document.addEventListener('visibilitychange', poll);
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', poll); };
+  }, [pingMonitor, connectors.appPassword, health.authRequired]);
+
+  useEffect(() => {
+    const discovered = projects.filter((project) => project.renderUrl).map((project) => ({ project, url: project.renderUrl }));
+    if (!discovered.length) return;
+    setMonitors((rows) => {
+      const known = new Set(rows.map((item) => item.url));
+      const additions = discovered.filter((item) => {
+        try { return !known.has(normalizeMonitorUrl(item.url)); } catch { return false; }
+      }).map(({ project, url }) => ({ id: `project_${project.id}`, name: project.name, url: normalizeMonitorUrl(url), intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' }));
+      return additions.length ? [...additions, ...rows].slice(0, 30) : rows;
+    });
+  }, [projects]);
+
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -194,7 +285,8 @@ function App() {
 
   useEffect(() => {
     if (!active?.activeFile) { setEditorDraft(''); setEditorDirty(false); return; }
-    setEditorDraft(active.files?.[active.activeFile] || '');
+    const content = active.files?.[active.activeFile] || '';
+    setEditorDraft(isBinaryAsset(content) ? '' : content);
     setEditorDirty(false);
   }, [active?.id, active?.activeFile, active?.files]);
 
@@ -215,7 +307,8 @@ function App() {
 
   useEffect(() => {
     try {
-      writeSession(SECRET_KEYS.anthropicKey, connectors.anthropicKey);
+      writeSession(SECRET_KEYS.openRouterKey1, connectors.openRouterKey1);
+      writeSession(SECRET_KEYS.openRouterKey2, connectors.openRouterKey2);
       writeSession(SECRET_KEYS.githubToken, connectors.githubToken);
       writeSession(SECRET_KEYS.renderToken, connectors.renderToken);
       writeSession(SECRET_KEYS.appPassword, connectors.appPassword);
@@ -317,7 +410,8 @@ function App() {
   const effectiveCredentials = (projectId) => {
     const vault = projectId ? parseVault(projectId) : {};
     return {
-      anthropicKey: vault.anthropicKey || connectors.anthropicKey || '',
+      openRouterKey1: vault.openRouterKey1 || connectors.openRouterKey1 || '',
+      openRouterKey2: vault.openRouterKey2 || connectors.openRouterKey2 || '',
       githubToken: vault.githubToken || connectors.githubToken || '',
       renderToken: vault.renderToken || connectors.renderToken || '',
     };
@@ -333,6 +427,14 @@ function App() {
     } catch (error) { showToast(error.message, 'error'); }
     finally { setCheckingGithub(false); }
   };
+  const testOpenRouter = async () => {
+    setCheckingOpenRouter(true);
+    try {
+      const data = await api('/api/openrouter/test', { key1: connectors.openRouterKey1 || '', key2: connectors.openRouterKey2 || '' });
+      showToast(data.remainingFreeRequests === null ? 'OpenRouter key is valid; free-model availability may vary.' : `OpenRouter key is valid · ${data.remainingFreeRequests} free requests remain today.`, 'success');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { setCheckingOpenRouter(false); }
+  };
   const testRender = async () => {
     setCheckingRender(true);
     try {
@@ -340,6 +442,24 @@ function App() {
       showToast('Render API connection is healthy.', 'success');
     } catch (error) { showToast(error.message, 'error'); }
     finally { setCheckingRender(false); }
+  };
+
+  const saveOpenRouterKeysToServer = async (key1, key2) => {
+    const first = String(key1 || '').trim();
+    const second = String(key2 || '').trim();
+    if (!first || first.length < 20 || (second && second.length < 20)) throw new Error('Enter one or two OpenRouter keys before saving.');
+    const result = await api('/api/settings/openrouter-keys', { key1: first, key2: second, renderToken: connectors.renderToken || '' });
+    setHealth((current) => ({ ...current, envConfigured: { ...(current.envConfigured || {}), openrouter: true } }));
+    showToast('OpenRouter keys are saved in Render. Free routing activates after the queued deploy.', 'success');
+    return result;
+  };
+
+  const saveAppPinToServer = async (pin) => {
+    const value = String(pin || '').trim();
+    if (!/^\d{4}$/.test(value)) throw new Error('Choose exactly four digits for the App PIN.');
+    const result = await api('/api/settings/app-pin', { pin: value, renderToken: connectors.renderToken || '' });
+    showToast('App PIN saved in Render. It becomes active when the queued deploy starts.', 'success');
+    return result;
   };
 
   const saveGithubTokenToServer = async (githubToken, expiry) => {
@@ -392,23 +512,68 @@ function App() {
   };
 
   const newProjectFromHome = () => {
-    if (!startInput.trim()) { showToast('Paste your code or project instructions first.', 'error'); return; }
+    if (!startInput.trim() && !Object.keys(startFiles).length) { showToast('Paste a brief or code dump, or upload a ZIP archive first.', 'error'); return; }
     const name = startName.trim() || (startRepo.split('/').filter(Boolean).at(-1) || 'New project').replace(/[-_]/g, ' ');
     const project = newProject(name);
     project.rawInput = startInput;
+    project.files = { ...startFiles };
+    project.activeFile = Object.keys(project.files).sort()[0] || '';
     project.repo = startRepo.trim();
+    project.branch = startBranch.trim() || 'main';
     project.autoDeploy = startAutoDeploy;
+    project.status = Object.keys(project.files).length ? 'ready' : 'draft';
     setProjects((current) => [project, ...current]);
     setActiveId(project.id);
     setWorkspaceTab('build');
     setPage('workspace');
+    if (Object.keys(project.files).length) updateProjectFiles(project.id, project.files);
     saveProject(project).then(() => savedVersions.current.set(project.id, project.updatedAt)).catch(() => {});
-    showToast('Project workspace created. Starting the real pipeline…', 'success');
+    showToast(project.repo ? 'Project workspace created. Starting the verified release path…' : 'Project workspace created. Add a GitHub repository when you are ready to build.');
     if (project.repo) window.setTimeout(() => runFullPipeline(project), 50);
   };
 
+  const importZipFile = async (file) => {
+    if (!file) return;
+    setZipBusy(true);
+    try {
+      const result = await extractProjectZip(file);
+      setStartFiles(result.files);
+      setZipFilename(file.name);
+      showToast(`Imported ${result.count} text files${result.skipped ? ` · skipped ${result.skipped} generated/binary entries` : ''}.`, 'success');
+    } catch (error) { setStartFiles({}); setZipFilename(''); showToast(error.message || 'Could not read that ZIP archive.', 'error'); }
+    finally { setZipBusy(false); }
+  };
+
+  const importGithubRepo = async () => {
+    const repository = startRepo.trim();
+    if (!repository) { showToast('Enter owner/repo or a GitHub URL first.', 'error'); return; }
+    const token = connectors.githubToken || '';
+    if (!token && !health.envConfigured?.github) { setSettingsOpen(true); showToast('Connect GitHub in Settings to import a repository.', 'error'); return; }
+    setImportingGithub(true);
+    try {
+      const result = await api('/api/github/import', { token, repository, branch: startBranch || '' });
+      const name = startName.trim() || repository.split('/').at(-1)?.replace(/[-_]/g, ' ') || 'Imported project';
+      const project = newProject(name);
+      project.repo = result.repository;
+      project.branch = result.branch;
+      project.files = result.files || {};
+      project.activeFile = Object.keys(project.files).sort()[0] || '';
+      project.rawInput = '';
+      project.status = 'ready';
+      project.summary = `Imported ${result.count} text files from ${result.repository} (${result.branch}).`;
+      project.autoDeploy = startAutoDeploy;
+      setProjects((current) => [project, ...current]);
+      setActiveId(project.id); setWorkspaceTab('build'); setPage('workspace');
+      updateProjectFiles(project.id, project.files);
+      saveProject(project).then(() => savedVersions.current.set(project.id, project.updatedAt)).catch(() => {});
+      showToast(`Imported ${result.count} files. Choose GitHub-only checks or auto-deploy after they pass.`, 'success');
+    } catch (error) { showToast(error.message || 'Could not import the repository.', 'error'); }
+    finally { setImportingGithub(false); }
+  };
+
   const createNewProject = () => {
-    setStartInput(''); setStartRepo(''); setStartName(''); setStartAutoDeploy(true);
+    setStartInput(''); setStartFiles({}); setZipFilename(''); setStartSourceMode('code');
+    setStartRepo(''); setStartBranch(''); setStartName(''); setStartAutoDeploy(true);
     setActiveId(''); setPage('start');
   };
 
@@ -434,8 +599,8 @@ function App() {
     if (!project || appBusy) return;
     const credentials = effectiveCredentials(project.id);
     if (!credentials.githubToken && !health.envConfigured?.github) { setSettingsOpen(true); showToast('Add a GitHub token in Settings or save one in the server environment.', 'error'); return; }
-    const needsClaude = Boolean(project.rawInput?.trim());
-    if (needsClaude && !credentials.anthropicKey && !health.envConfigured?.anthropic) { setSettingsOpen(true); showToast('Add an Anthropic key to organize a new code dump.', 'error'); return; }
+    const needsOpenRouter = Boolean(project.rawInput?.trim());
+    if (needsOpenRouter && !credentials.openRouterKey1 && !credentials.openRouterKey2 && !health.envConfigured?.openrouter) { setSettingsOpen(true); showToast('Add an OpenRouter key to organize a pasted brief or code dump.', 'error'); return; }
     const runProject = { ...project };
     if (project.status === 'verified' && Object.keys(project.files || {}).length) runProject.rawInput = '';
     const envVars = (project.id === activeId ? projectEnv : parseProjectEnv(project.id)).filter((row) => row.key && row.value !== undefined).map(({ key, value }) => ({ key, value: String(value) }));
@@ -447,7 +612,7 @@ function App() {
         credentials,
         renderOwnerId: connectors.renderOwnerId,
         envVars,
-        model: 'claude-sonnet-5-5',
+        model: 'openrouter/free',
       });
       updateProject(project.id, { jobId: started.jobId, status: 'running', progress: 1, activeAgent: 'StackPilot orchestrator' });
       pollCursor.current.set(started.jobId, { after: 0, version: 0 });
@@ -505,7 +670,7 @@ function App() {
   };
 
   const saveEditor = () => {
-    if (!active?.activeFile) return;
+    if (!active?.activeFile || isBinaryAsset(active.files?.[active.activeFile])) return;
     const files = { ...active.files, [active.activeFile]: editorDraft };
     updateProject(active.id, { files, isDemo: false });
     updateProjectFiles(active.id, files);
@@ -549,8 +714,10 @@ function App() {
   return (
     <div className="site-shell">
       {page === 'start' && <StartPage
-        input={startInput} setInput={setStartInput} repo={startRepo} setRepo={setStartRepo} name={startName} setName={setStartName}
-        autoDeploy={startAutoDeploy} setAutoDeploy={setStartAutoDeploy} onStart={newProjectFromHome}
+        input={startInput} setInput={setStartInput} filesCount={Object.keys(startFiles).length} zipFilename={zipFilename} zipBusy={zipBusy} onZipUpload={importZipFile}
+        sourceMode={startSourceMode} setSourceMode={setStartSourceMode} importingGithub={importingGithub} onImportGithub={importGithubRepo}
+        repo={startRepo} setRepo={setStartRepo} branch={startBranch} setBranch={setStartBranch} name={startName} setName={setStartName}
+        autoDeploy={startAutoDeploy} setAutoDeploy={setStartAutoDeploy} onStart={newProjectFromHome} onOpenMonitors={() => setPage('monitor')}
         projects={filteredProjects} onOpen={openProject} onNew={createNewProject} onDelete={deleteProject}
         search={search} setSearch={setSearch} onSettings={() => setSettingsOpen(true)} onAbout={() => setPage('about')}
         health={health} connectorCount={connectorCount} notificationsReady={notificationReady} onEnableNotifications={enableNotifications}
@@ -565,16 +732,18 @@ function App() {
         onNameChange={updateProjectName} onRepoChange={updateRepo} onProjectChange={(patch) => updateProject(active.id, patch)} onRun={runOrDeploy} onToggleAutoDeploy={toggleAutoDeploy}
         busy={appBusy} onDelete={() => deleteProject(active.id)} onEditorChange={(value) => { setEditorDraft(value); setEditorDirty(true); }}
         editorDraft={editorDraft} editorDirty={editorDirty} onSaveEditor={saveEditor} onSelectFile={selectFile} onAddFile={addFile}
-        onAbout={() => setPage('about')} onShowToast={showToast} onRefreshEnv={() => updateProjectFiles(active.id, active.files || {})}
+        onAbout={() => setPage('about')} onOpenMonitors={() => setPage('monitor')} onShowToast={showToast} onRefreshEnv={() => updateProjectFiles(active.id, active.files || {})}
         shellCommand={shellCommand} setShellCommand={setShellCommand} shellBusy={shellBusy} onRunShell={runShellCommand}
       />}
-      {page === 'about' && <AboutPage projects={projects} onBack={() => setPage(activeId ? 'workspace' : 'start')} expiry={tokenExpiry} daysLeft={tokenDaysLeft} health={health} onSettings={() => setSettingsOpen(true)} onOpen={openProject} />}
+      {page === 'about' && <AboutPage projects={projects} onBack={() => setPage(activeId ? 'workspace' : 'start')} expiry={tokenExpiry} daysLeft={tokenDaysLeft} health={health} onSettings={() => setSettingsOpen(true)} onOpenMonitors={() => setPage('monitor')} onOpen={openProject} />}
       {page === 'deployments' && <DeploymentsPage projects={projects} onBack={() => setPage('start')} onOpen={openProject} />}
+      {page === 'monitor' && <MonitorPage monitors={monitors} onBack={() => setPage(activeId ? 'workspace' : 'start')} onAdd={addMonitor} onPing={pingMonitor} onRemove={removeMonitor} onInterval={(id, intervalSec) => setMonitors((rows) => rows.map((item) => item.id === id ? { ...item, intervalSec: Number(intervalSec) } : item))} />}
 
       {settingsOpen && <SettingsModal
         connectors={connectors} setConnectors={setConnectors} health={health} tokenExpiry={tokenExpiry} setTokenExpiry={setTokenExpiry}
-        githubIdentity={githubIdentity} checkingGithub={checkingGithub} checkingRender={checkingRender}
-        onGithubTest={testGithub} onRenderTest={testRender} onSaveGithubToServer={saveGithubTokenToServer}
+        githubIdentity={githubIdentity} checkingGithub={checkingGithub} checkingRender={checkingRender} checkingOpenRouter={checkingOpenRouter}
+        onGithubTest={testGithub} onRenderTest={testRender} onOpenRouterTest={testOpenRouter} onSaveGithubToServer={saveGithubTokenToServer}
+        onSaveOpenRouterKeys={saveOpenRouterKeysToServer} onSaveAppPin={saveAppPinToServer}
         onSave={() => { setSettingsOpen(false); showToast('Settings saved for this browser session.', 'success'); }}
         onEnableNotifications={enableNotifications} onDisableNotifications={disableNotifications} notificationReady={notificationReady} onClose={() => setSettingsOpen(false)}
       />}
@@ -584,7 +753,7 @@ function App() {
   );
 }
 
-function StartPage({ input, setInput, repo, setRepo, name, setName, autoDeploy, setAutoDeploy, onStart, projects, onOpen, onNew, onDelete, search, setSearch, onSettings, onAbout, health, connectorCount, notificationsReady, onEnableNotifications, onSample, onInstallHelp, onCopyMonitor }) {
+function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onZipUpload, sourceMode, setSourceMode, importingGithub, onImportGithub, repo, setRepo, branch, setBranch, name, setName, autoDeploy, setAutoDeploy, onStart, projects, onOpen, onNew, onDelete, search, setSearch, onSettings, onAbout, onOpenMonitors, health, connectorCount, notificationsReady, onEnableNotifications, onSample, onInstallHelp, onCopyMonitor }) {
   const running = projects.filter((project) => ['queued', 'running', 'deploying'].includes(project.status));
   return <div className="start-page">
     <header className="start-header">
@@ -592,6 +761,7 @@ function StartPage({ input, setInput, repo, setRepo, name, setName, autoDeploy, 
       <div className="start-header-actions">
         <span className={`server-pill ${health.ok ? 'server-online' : ''}`}><i />{health.ok ? 'Monitor endpoint ready' : 'Checking workspace'}</span>
         <button className="header-link" onClick={onEnableNotifications}><Bell size={15} /><span>{notificationsReady ? 'Notifications on' : 'Notifications'}</span></button>
+        <button className="header-link" onClick={onOpenMonitors}><Wifi size={15} /><span>Monitors</span></button>
         <button className="header-link" onClick={onAbout}><Activity size={15} /><span>My work</span></button>
         <button className="header-settings" onClick={onSettings} aria-label="Settings"><Settings2 size={17} /><span>{connectorCount}/3</span></button>
       </div>
@@ -610,12 +780,20 @@ function StartPage({ input, setInput, repo, setRepo, name, setName, autoDeploy, 
 
       <section className="launch-card" aria-labelledby="launch-title">
         <div className="launch-header"><div className="launch-number">01</div><div><h2 id="launch-title">Start with your code</h2><p>Paste a dump, a brief, or files plus instructions. You can edit everything after.</p></div><button className="sample-link" onClick={onSample}><Sparkles size={14} /> Try sample</button></div>
+        <div className="source-mode-switch" role="tablist" aria-label="Choose project source"><button className={sourceMode === 'code' ? 'selected' : ''} onClick={() => setSourceMode('code')}><FileCode2 size={14} /> Code / ZIP</button><button className={sourceMode === 'github' ? 'selected' : ''} onClick={() => setSourceMode('github')}><GitBranch size={14} /> Existing GitHub repo</button></div>
         <label className="start-field"><span>Project name <small>Optional</small></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="A name for this build" /></label>
-        <label className="start-field start-dump-field"><span>Code or instructions</span><textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder={'Paste the whole code response here — even if it is one long block.\n\nStackPilot will organize it into files, complete obvious gaps, and build a live project workspace.'} /></label>
-        <label className="start-field"><span>GitHub repository <small>owner/repo</small></span><div className="start-repo-input"><Github size={16} /><input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="your-name/project-name" autoCapitalize="none" autoCorrect="off" spellCheck="false" /></div></label>
+        {sourceMode === 'code' ? <>
+          <label className="start-field start-dump-field"><span>Code or instructions <small>OpenRouter free model used only for pasted briefs/dumps</small></span><textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder={'Paste code or a short build brief.\n\nZIP and repository imports skip the AI organize step, saving free-model requests.'} /></label>
+          <div className="zip-upload-row"><label className="zip-file-button"><input type="file" accept=".zip,application/zip,application/x-zip-compressed" onChange={(event) => { onZipUpload(event.target.files?.[0]); event.target.value = ''; }} /><FileArchive size={15} />{zipBusy ? 'Reading ZIP…' : 'Add project ZIP'}<small>15 MB max</small></label>{zipFilename && <span className="zip-import-status"><CheckCircle2 size={13} /> {zipFilename} · {filesCount} source files/assets</span>}</div>
+          <label className="start-field"><span>GitHub destination <small>Optional for drafts</small></span><div className="start-repo-input"><Github size={16} /><input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="owner/repo or new repo name" autoCapitalize="none" autoCorrect="off" spellCheck="false" /></div></label>
+        </> : <>
+          <label className="start-field"><span>GitHub repository <small>owner/repo or URL</small></span><div className="start-repo-input"><Github size={16} /><input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="your-name/project-name" autoCapitalize="none" autoCorrect="off" spellCheck="false" /></div></label>
+          <label className="start-field"><span>Branch <small>blank uses the repository default</small></span><input value={branch} onChange={(event) => setBranch(event.target.value)} placeholder="main" autoCapitalize="none" autoCorrect="off" /></label>
+          <div className="github-import-note"><GitBranch size={14} /><span>Imports safe text and common media assets from the selected branch. Review files before the GitHub checks and optional Render release.</span></div>
+        </>}
         <div className="launch-options"><label className="auto-deploy-toggle"><input type="checkbox" checked={autoDeploy} onChange={(event) => setAutoDeploy(event.target.checked)} /><span className="toggle-ui" /><span><strong>Auto-deploy after checks pass</strong><small>Turn off to review the tested GitHub build before publishing.</small></span></label><span className="plan-chip"><Cloud size={13} /> Render Free</span></div>
-        <div className="launch-actions"><button className="launch-button" onClick={onStart} disabled={!input.trim()}><Sparkles size={17} /> Create project workspace <ArrowRight size={16} /></button><span className="secure-note"><LockKeyhole size={12} /> Keys stay out of your source files</span></div>
-        <div className="launch-connection-note"><span className={`connection-dot ${health.envConfigured?.github || connectorCount ? 'is-ready' : ''}`} />{health.envConfigured?.github || connectorCount ? 'Connections are ready. Review project-specific keys inside the workspace.' : 'Connect GitHub, Anthropic, and Render in Settings to run a real build.'}<button onClick={onSettings}>Settings <ArrowUpRight size={12} /></button></div>
+        <div className="launch-actions"><button className="launch-button" onClick={sourceMode === 'github' ? onImportGithub : onStart} disabled={sourceMode === 'github' ? (!repo.trim() || importingGithub) : (!input.trim() && !filesCount)}>{importingGithub ? <Loader2 size={17} className="spin" /> : sourceMode === 'github' ? <GitBranch size={17} /> : <Sparkles size={17} />}{sourceMode === 'github' ? 'Import repository' : 'Create project workspace'} <ArrowRight size={16} /></button><span className="secure-note"><LockKeyhole size={12} /> Keys stay out of your source files</span></div>
+        <div className="launch-connection-note"><span className={`connection-dot ${health.envConfigured?.github || connectorCount ? 'is-ready' : ''}`} />{health.envConfigured?.github || connectorCount ? 'Connections are ready. Review project-specific keys inside the workspace.' : 'Connect GitHub, OpenRouter (optional for ZIP), and Render in Settings.'}<button onClick={onSettings}>Settings <ArrowUpRight size={12} /></button></div>
       </section>
 
       {running.length > 0 && <section className="running-strip"><div className="running-strip-icon"><Loader2 size={16} className="spin" /></div><div><strong>{running.length} project{running.length === 1 ? '' : 's'} still working</strong><span>Runs continue on StackPilot while this page is closed.</span></div><button onClick={() => onOpen(running[0].id)}>View live progress <ArrowRight size={14} /></button></section>}
@@ -642,7 +820,7 @@ function ProjectCard({ project, onOpen, onDelete }) {
   </article>;
 }
 
-function ProjectWorkspace({ project, credentials, envConfigured, projectVault, onVaultChange, envRows, onEnvChange, onAddEnv, onRemoveEnv, tab, setTab, onHome, onSettings, onNameChange, onRepoChange, onProjectChange, onRun, onToggleAutoDeploy, busy, onDelete, onEditorChange, editorDraft, editorDirty, onSaveEditor, onSelectFile, onAddFile, onAbout, onShowToast, onRefreshEnv, shellCommand, setShellCommand, shellBusy, onRunShell }) {
+function ProjectWorkspace({ project, credentials, envConfigured, projectVault, onVaultChange, envRows, onEnvChange, onAddEnv, onRemoveEnv, tab, setTab, onHome, onSettings, onNameChange, onRepoChange, onProjectChange, onRun, onToggleAutoDeploy, busy, onDelete, onEditorChange, editorDraft, editorDirty, onSaveEditor, onSelectFile, onAddFile, onAbout, onOpenMonitors, onShowToast, onRefreshEnv, shellCommand, setShellCommand, shellBusy, onRunShell }) {
   const progress = calculateProgress(project.steps, project.status, project.progress);
   const isWorking = ['queued', 'running', 'deploying'].includes(project.status);
   const canDeploy = Boolean(project.renderUrl || project.renderServiceId || credentials.renderToken || envConfigured.render);
@@ -658,7 +836,7 @@ function ProjectWorkspace({ project, credentials, envConfigured, projectVault, o
     <header className="workspace-header">
       <button className="workspace-brand" onClick={onHome}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button>
       <div className="workspace-breadcrumb"><button onClick={onHome}>Projects</button><ChevronRight size={13} /><span>{project.name}</span></div>
-      <div className="workspace-header-actions"><button className="header-link" onClick={onAbout}><Activity size={15} /><span>My work</span></button><button className="header-settings" onClick={onSettings} aria-label="Settings"><Settings2 size={17} /></button></div>
+      <div className="workspace-header-actions"><button className="header-link" onClick={onOpenMonitors}><Wifi size={15} /><span>Monitors</span></button><button className="header-link" onClick={onAbout}><Activity size={15} /><span>My work</span></button><button className="header-settings" onClick={onSettings} aria-label="Settings"><Settings2 size={17} /></button></div>
     </header>
 
     <main className="workspace-main">
@@ -695,7 +873,7 @@ function ProjectWorkspace({ project, credentials, envConfigured, projectVault, o
 
       {tab === 'files' && <div className="files-layout">
         <section className="workspace-card files-card"><div className="card-header"><div className="card-title-icon blue"><Folder size={16} /></div><div><strong>Project files</strong><span>Tap a file to edit it. Changes stay in this project until the next run.</span></div><button className="small-action add-file-action" onClick={onAddFile}><Plus size={14} /> New file</button></div><div className="file-explorer-root"><ChevronDown size={13} /><Folder size={14} />{project.slug || 'project'}</div><FileTree files={project.files || {}} current={project.activeFile} onSelect={onSelectFile} />{!Object.keys(project.files || {}).length && <div className="empty-files"><FileCode2 size={22} /><strong>Your organized files will appear here</strong><span>Paste a dump and run the Project Architect.</span></div>}</section>
-        <section className="workspace-card editor-card"><div className="editor-card-header"><div className="file-name-label"><FileCode2 size={15} /><span>{project.activeFile || 'Choose a file'}</span><em>{project.activeFile ? fileLanguage(project.activeFile) : '—'}</em></div><div className="editor-card-actions">{editorDirty && <span className="unsaved-chip">Unsaved</span>}<button className="small-action" disabled={!editorDraft} onClick={() => navigator.clipboard?.writeText(editorDraft).then(() => onShowToast('File copied.')).catch(() => onShowToast('Copy is unavailable in this browser.', 'error'))}><Copy size={13} /> Copy</button><button className="save-editor-button" disabled={!editorDirty} onClick={onSaveEditor}><Save size={13} /> Save</button></div></div>{project.activeFile ? <div className="code-editor-wrap"><div className="line-gutter">{Array.from({ length: Math.max(1, editorDraft.split('\n').length) }, (_, index) => <span key={index}>{index + 1}</span>)}</div><textarea spellCheck="false" className="code-editor" value={editorDraft} onChange={(event) => onEditorChange(event.target.value)} aria-label={`Edit ${project.activeFile}`} /></div> : <div className="editor-empty"><div><Code2 size={24} /></div><strong>Select a file</strong><span>Your editor is ready for quick changes on desktop or iPhone.</span></div>}<div className="editor-bottom"><span>UTF-8 <i /> {project.activeFile ? `${editorDraft.split('\n').length} lines` : 'No file selected'}</span><span>Mobile-friendly plain editor</span></div></section>
+        <section className="workspace-card editor-card"><div className="editor-card-header"><div className="file-name-label"><FileCode2 size={15} /><span>{project.activeFile || 'Choose a file'}</span><em>{project.activeFile ? fileLanguage(project.activeFile) : '—'}</em></div><div className="editor-card-actions">{editorDirty && <span className="unsaved-chip">Unsaved</span>}<button className="small-action" disabled={!editorDraft} onClick={() => navigator.clipboard?.writeText(editorDraft).then(() => onShowToast('File copied.')).catch(() => onShowToast('Copy is unavailable in this browser.', 'error'))}><Copy size={13} /> Copy</button><button className="save-editor-button" disabled={!editorDirty} onClick={onSaveEditor}><Save size={13} /> Save</button></div></div>{project.activeFile ? isBinaryAsset(project.files?.[project.activeFile]) ? <BinaryAssetPreview path={project.activeFile} content={project.files[project.activeFile]} /> : <div className="code-editor-wrap"><div className="line-gutter">{Array.from({ length: Math.max(1, editorDraft.split('\n').length) }, (_, index) => <span key={index}>{index + 1}</span>)}</div><textarea spellCheck="false" className="code-editor" value={editorDraft} onChange={(event) => onEditorChange(event.target.value)} aria-label={`Edit ${project.activeFile}`} /></div> : <div className="editor-empty"><div><Code2 size={24} /></div><strong>Select a file</strong><span>Your editor is ready for quick changes on desktop or iPhone.</span></div>}<div className="editor-bottom"><span>UTF-8 <i /> {project.activeFile ? isBinaryAsset(project.files?.[project.activeFile]) ? `${binaryAssetByteLength(project.files[project.activeFile]).toLocaleString()} bytes` : `${editorDraft.split('\n').length} lines` : 'No file selected'}</span><span>Mobile-friendly editor · binary assets preserved</span></div></section>
       </div>}
 
       {tab === 'preview' && <div className="preview-layout">
@@ -742,7 +920,7 @@ function ShellRunner({ command, setCommand, onRun, busy, repo }) {
 function ActivityPanel({ project, onClear }) {
   const [expanded, setExpanded] = useState(true);
   const logs = (project.logs || []).slice(-100);
-  return <section className="activity-card"><div className="activity-header"><div><div className="activity-live-dot" /><strong>Live activity</strong><span>{['queued', 'running', 'deploying'].includes(project.status) ? 'STREAMING' : 'RUN HISTORY'}</span></div><div className="activity-actions"><button className="small-action" onClick={() => setExpanded((value) => !value)}>{expanded ? 'Collapse' : 'Expand'}</button><button className="icon-only" onClick={onClear} title="Clear local activity"><Trash2 size={14} /></button></div></div>{expanded && <div className="activity-log">{logs.length ? logs.map((line, index) => <div className={`activity-line level-${line.level || 'info'}`} key={`${line.jobLogId || line.time}_${index}`}><span className="activity-time">{timeLabel(line.time)}</span><span className="activity-source">{line.source || 'StackPilot'}</span><span className="activity-text">{line.text}</span></div>) : <div className="activity-placeholder"><span>$</span>Activity from Claude, GitHub Actions, and Render will show up here.</div>}</div>}{expanded && <div className="activity-footer"><span><Radio size={12} /> Server-side run tracking</span><span>Refreshes every 2.2 seconds while open</span></div>}</section>;
+  return <section className="activity-card"><div className="activity-header"><div><div className="activity-live-dot" /><strong>Live activity</strong><span>{['queued', 'running', 'deploying'].includes(project.status) ? 'STREAMING' : 'RUN HISTORY'}</span></div><div className="activity-actions"><button className="small-action" onClick={() => setExpanded((value) => !value)}>{expanded ? 'Collapse' : 'Expand'}</button><button className="icon-only" onClick={onClear} title="Clear local activity"><Trash2 size={14} /></button></div></div>{expanded && <div className="activity-log">{logs.length ? logs.map((line, index) => <div className={`activity-line level-${line.level || 'info'}`} key={`${line.jobLogId || line.time}_${index}`}><span className="activity-time">{timeLabel(line.time)}</span><span className="activity-source">{line.source || 'StackPilot'}</span><span className="activity-text">{line.text}</span></div>) : <div className="activity-placeholder"><span>$</span>Activity from OpenRouter, GitHub Actions, and Render will show up here.</div>}</div>}{expanded && <div className="activity-footer"><span><Radio size={12} /> Server-side run tracking</span><span>Refreshes every 2.2 seconds while open</span></div>}</section>;
 }
 
 function ReleaseSummary({ project, canDeploy, autoDeploy, onToggleAutoDeploy, onRun, busy, onSettings }) {
@@ -753,6 +931,8 @@ function ReleaseSummary({ project, canDeploy, autoDeploy, onToggleAutoDeploy, on
 function ReleaseSettings({ project, onRepoChange, onToggleAutoDeploy, onProjectChange, onSettings }) {
   return <section className="workspace-card release-settings-card"><div className="card-header"><div className="card-title-icon violet"><Settings2 size={16} /></div><div><strong>Release settings</strong><span>Choose where the verified source goes.</span></div><span className="free-chip"><i /> RENDER FREE</span></div>
     <label className="settings-field-inline"><span>GitHub repository</span><div className="start-repo-input"><Github size={15} /><input value={project.repo || ''} onChange={(event) => onRepoChange(event.target.value)} placeholder="owner/repo" autoCapitalize="none" autoCorrect="off" /></div></label>
+    <label className="settings-field-inline"><span>Existing Render service ID <small>optional · leave blank to create one</small></span><input value={project.renderServiceId || ''} onChange={(event) => onProjectChange({ renderServiceId: event.target.value.trim() })} placeholder="srv-…" /></label>
+    {project.renderServiceId && <div className="existing-service-gate-note"><ShieldCheck size={13} /> Before pushing, StackPilot turns off this service's direct GitHub auto-deploy. It will only queue a Render deploy after checks pass and Auto-deploy is enabled.</div>}
     <div className="settings-two-column"><label className="settings-field-inline"><span>Branch</span><input value={project.branch || 'main'} onChange={(event) => onProjectChange({ branch: event.target.value })} /></label><label className="settings-field-inline"><span>Service type</span><select value={project.serviceType || 'web_service'} onChange={(event) => onProjectChange({ serviceType: event.target.value })}><option value="web_service">Web service</option><option value="static_site">Static site</option></select></label></div>
     <div className="settings-two-column"><label className="settings-field-inline"><span>Runtime</span><select value={project.runtime || 'node'} onChange={(event) => onProjectChange({ runtime: event.target.value })}><option value="node">Node.js</option><option value="python">Python</option><option value="ruby">Ruby</option><option value="go">Go</option><option value="elixir">Elixir</option></select></label><label className="settings-field-inline"><span>Region</span><select value={project.region || 'frankfurt'} onChange={(event) => onProjectChange({ region: event.target.value })}><option value="frankfurt">Frankfurt</option><option value="singapore">Singapore</option><option value="oregon">Oregon</option><option value="ohio">Ohio</option><option value="virginia">Virginia</option></select></label></div>
     <label className="settings-field-inline"><span>Build command</span><input value={project.buildCommand || ''} onChange={(event) => onProjectChange({ buildCommand: event.target.value })} placeholder="npm install && npm run build" /></label>
@@ -762,7 +942,7 @@ function ReleaseSettings({ project, onRepoChange, onToggleAutoDeploy, onProjectC
 }
 
 function ProjectCredentialsCard({ vault, onChange }) {
-  return <section className="workspace-card project-credentials-card"><div className="card-header"><div className="card-title-icon blue"><KeyRound size={16} /></div><div><strong>Project-specific platform keys</strong><span>Optional overrides for this project only. These values stay in this browser session.</span></div></div><div className="project-credential-grid"><label className="settings-field-inline"><span>GitHub token override</span><input type="password" autoComplete="new-password" value={vault.githubToken || ''} onChange={(event) => onChange('githubToken', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>Render API key override</span><input type="password" autoComplete="new-password" value={vault.renderToken || ''} onChange={(event) => onChange('renderToken', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>Anthropic key override</span><input type="password" autoComplete="new-password" value={vault.anthropicKey || ''} onChange={(event) => onChange('anthropicKey', event.target.value)} placeholder="Use workspace default" /></label></div><div className="env-note"><ShieldCheck size={13} /> Overrides are not saved with the project files and are never pushed to GitHub.</div></section>;
+  return <section className="workspace-card project-credentials-card"><div className="card-header"><div className="card-title-icon blue"><KeyRound size={16} /></div><div><strong>Project-specific platform keys</strong><span>Optional overrides for this project only. These values stay in this browser session.</span></div></div><div className="project-credential-grid"><label className="settings-field-inline"><span>GitHub token override</span><input type="password" autoComplete="new-password" value={vault.githubToken || ''} onChange={(event) => onChange('githubToken', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>Render API key override</span><input type="password" autoComplete="new-password" value={vault.renderToken || ''} onChange={(event) => onChange('renderToken', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>OpenRouter key 1</span><input type="password" autoComplete="new-password" value={vault.openRouterKey1 || ''} onChange={(event) => onChange('openRouterKey1', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>OpenRouter key 2</span><input type="password" autoComplete="new-password" value={vault.openRouterKey2 || ''} onChange={(event) => onChange('openRouterKey2', event.target.value)} placeholder="Use workspace default" /></label></div><div className="env-note"><ShieldCheck size={13} /> Overrides are not saved with project files and are never pushed to GitHub.</div></section>;
 }
 
 function EnvironmentCard({ rows, onChange, onAdd, onRemove, onRefresh, serviceId, envConfigured, credentials }) {
@@ -776,6 +956,14 @@ function EnvironmentCard({ rows, onChange, onAdd, onRemove, onRefresh, serviceId
 }
 
 function RefreshIcon() { return <Activity size={13} />; }
+
+function BinaryAssetPreview({ path, content }) {
+  const asset = parseBinaryAsset(content);
+  if (!asset) return <div className="binary-asset-preview"><AlertTriangle size={18} /><span>Binary asset encoding could not be read.</span></div>;
+  const data = binaryAssetDataUri(content);
+  const size = binaryAssetByteLength(content);
+  return <div className="binary-asset-preview">{asset.mime.startsWith('image/') ? <img src={data} alt={path} /> : asset.mime.startsWith('audio/') ? <audio controls src={data} /> : asset.mime.startsWith('video/') ? <video controls src={data} /> : <div className="binary-asset-placeholder"><FileArchive size={24} /><strong>{asset.mime}</strong><span>Binary source asset preserved for GitHub and deployment.</span></div>}<div className="binary-asset-meta"><span>{size.toLocaleString()} bytes · included in release</span><a href={data} download={path.split('/').at(-1)} className="small-action"><Download size={13} /> Download copy</a></div></div>;
+}
 
 function FileTree({ files, current, onSelect }) {
   const [closed, setClosed] = useState({});
@@ -802,13 +990,53 @@ function RenderStatusCard({ project, onSettings }) {
   return <section className="workspace-card render-status-card"><div className="card-header"><div className="card-title-icon green"><Cloud size={16} /></div><div><strong>Render status</strong><span>Configured from your release settings.</span></div></div><div className="render-status-line"><span className={`status-light ${project.status === 'live' ? 'light-green' : project.status === 'deploying' ? 'light-violet' : ''}`} /><strong>{project.status === 'live' ? 'Live' : project.status === 'deploying' ? 'Building' : project.status === 'verified' ? 'Waiting for deploy' : 'Not deployed yet'}</strong></div>{project.renderServiceId && <div className="service-id-line">Service <code>{project.renderServiceId}</code></div>}{project.renderDashboardUrl && <a className="small-action" href={project.renderDashboardUrl} target="_blank" rel="noreferrer"><Cloud size={13} /> Open Render dashboard <ExternalLink size={12} /></a>}<button className="small-action" onClick={onSettings}><KeyRound size={13} /> Edit Render key</button></section>;
 }
 
-function AboutPage({ projects, onBack, expiry, daysLeft, health, onSettings, onOpen }) {
+function AboutPage({ projects, onBack, expiry, daysLeft, health, onSettings, onOpenMonitors, onOpen }) {
   const live = projects.filter((project) => project.status === 'live').length;
   const working = projects.filter((project) => ['queued', 'running', 'deploying'].includes(project.status)).length;
   const commits = projects.filter((project) => project.lastCommit).length;
   const exactExpiry = expiry ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeZone: 'UTC' }).format(new Date(`${expiry}T12:00:00Z`)) : '';
   const expiryText = expiry ? `${exactExpiry} · ${daysLeft < 0 ? `expired ${Math.abs(daysLeft)} day${Math.abs(daysLeft) === 1 ? '' : 's'} ago` : daysLeft === 0 ? 'expires today' : `expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`}` : 'Add a reminder date in Settings';
-  return <div className="about-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Workspace</button><ChevronRight size={13} /><span>My work</span></div><button className="header-settings" onClick={onSettings}><Settings2 size={17} /></button></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">ABOUT YOUR WORKSPACE</span><h1>Built to make progress visible.</h1><p>StackPilot turns a code dump into a reviewed GitHub commit, a real hosted build, and a live Render link.</p></div><div className="about-stat-grid"><div><strong>{projects.length}</strong><span>projects saved</span></div><div><strong>{live}</strong><span>live on Render</span></div><div><strong>{commits}</strong><span>GitHub commits</span></div><div><strong>{working}</strong><span>runs in progress</span></div></div><div className="about-detail-grid"><section className="workspace-card about-card"><div className="card-title-icon violet"><Github size={16} /></div><div><strong>GitHub token reminder</strong><span>GitHub does not reveal a PAT's expiry date through this integration. Add the date you chose when creating it; StackPilot will remind you at 7, 3, 1, and 0 days when notifications are enabled.</span></div><div className={`expiry-status ${daysLeft !== null && daysLeft <= 7 ? 'expiry-warning' : ''}`}><CalendarDays size={15} />{expiryText}</div><button className="soft-button" onClick={onSettings}>Manage token & reminder <ArrowRight size={14} /></button></section><section className="workspace-card about-card"><div className="card-title-icon green"><Radio size={16} /></div><div><strong>UptimeRobot endpoint</strong><span>Use this public URL for a simple HTTP(S) monitor. It stays outside the workspace password.</span></div><div className="monitor-url"><code>{typeof window !== 'undefined' ? `${window.location.origin}/health` : '/health'}</code><button onClick={() => navigator.clipboard?.writeText(`${window.location.origin}/health`)}><Copy size={13} /></button></div><div className="health-fact">{health?.ok ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}{health?.ok ? "StackPilot health is reachable. Monitor /health in UptimeRobot." : "The health endpoint could not be reached just now."}</div></section></div><section className="about-projects"><div className="recent-heading"><div><span className="section-eyebrow">PROJECT HISTORY</span><h2>Your work</h2></div><button className="soft-button" onClick={onSettings}>Settings <Settings2 size={14} /></button></div>{projects.length ? <div className="recent-grid">{projects.slice(0, 8).map((project) => <button className="about-project-row" key={project.id} onClick={() => onOpen(project.id)}><span className={`project-dot project-${project.status}`} /><span><strong>{project.name}</strong><small>{project.repo || 'Draft on this device'} · {timeAgo(project.updatedAt)}</small></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span><ArrowRight size={14} /></button>)}</div> : <div className="recent-empty"><strong>No projects yet</strong><span>Your first build will appear here.</span></div>}</section><p className="about-caveat">Drafts and project-specific environment values are stored in this browser session/device. GitHub is the durable source copy. Keep a separate backup of production credentials.</p></main></div>;
+  return <div className="about-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Workspace</button><ChevronRight size={13} /><span>My work</span></div><div className="workspace-header-actions"><button className="header-link" onClick={onOpenMonitors}><Wifi size={15} /><span>Monitors</span></button><button className="header-settings" onClick={onSettings}><Settings2 size={17} /></button></div></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">ABOUT YOUR WORKSPACE</span><h1>Built to make progress visible.</h1><p>StackPilot turns a code dump into a reviewed GitHub commit, a real hosted build, and a live Render link.</p></div><div className="about-stat-grid"><div><strong>{projects.length}</strong><span>projects saved</span></div><div><strong>{live}</strong><span>live on Render</span></div><div><strong>{commits}</strong><span>GitHub commits</span></div><div><strong>{working}</strong><span>runs in progress</span></div></div><div className="about-detail-grid"><section className="workspace-card about-card"><div className="card-title-icon violet"><Github size={16} /></div><div><strong>GitHub token reminder</strong><span>GitHub does not reveal a PAT's expiry date through this integration. Add the date you chose when creating it; StackPilot will remind you at 7, 3, 1, and 0 days when notifications are enabled.</span></div><div className={`expiry-status ${daysLeft !== null && daysLeft <= 7 ? 'expiry-warning' : ''}`}><CalendarDays size={15} />{expiryText}</div><button className="soft-button" onClick={onSettings}>Manage token & reminder <ArrowRight size={14} /></button></section><section className="workspace-card about-card"><div className="card-title-icon green"><Radio size={16} /></div><div><strong>UptimeRobot endpoint</strong><span>Use this public URL for a simple HTTP(S) monitor. It stays outside the workspace password.</span></div><div className="monitor-url"><code>{typeof window !== 'undefined' ? `${window.location.origin}/health` : '/health'}</code><button onClick={() => navigator.clipboard?.writeText(`${window.location.origin}/health`)}><Copy size={13} /></button></div><div className="health-fact">{health?.ok ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}{health?.ok ? "StackPilot health is reachable. Monitor /health in UptimeRobot." : "The health endpoint could not be reached just now."}</div></section></div><section className="about-projects"><div className="recent-heading"><div><span className="section-eyebrow">PROJECT HISTORY</span><h2>Your work</h2></div><button className="soft-button" onClick={onSettings}>Settings <Settings2 size={14} /></button></div>{projects.length ? <div className="recent-grid">{projects.slice(0, 8).map((project) => <button className="about-project-row" key={project.id} onClick={() => onOpen(project.id)}><span className={`project-dot project-${project.status}`} /><span><strong>{project.name}</strong><small>{project.repo || 'Draft on this device'} · {timeAgo(project.updatedAt)}</small></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span><ArrowRight size={14} /></button>)}</div> : <div className="recent-empty"><strong>No projects yet</strong><span>Your first build will appear here.</span></div>}</section><p className="about-caveat">Drafts and project-specific environment values are stored in this browser session/device. GitHub is the durable source copy. Keep a separate backup of production credentials.</p></main></div>;
+}
+
+function durationText(start) {
+  if (!start) return '—';
+  const ms = Math.max(0, Date.now() - new Date(start).getTime());
+  const minutes = Math.floor(ms / 60_000);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days) return `${days}d ${hours % 24}h`;
+  if (hours) return `${hours}h ${minutes % 60}m`;
+  return `${minutes}m`;
+}
+
+function monitorStateDuration(monitor) {
+  const checks = monitor.checks || [];
+  if (!checks.length) return 'Waiting for first check';
+  const current = checks.at(-1).ok;
+  let index = checks.length - 1;
+  while (index >= 0 && checks[index].ok === current) index -= 1;
+  const since = checks[index + 1]?.checkedAt || monitor.addedAt;
+  return `${current ? 'Up for ' : 'Down for '}${durationText(since)}`;
+}
+
+function MonitorPage({ monitors, onBack, onAdd, onPing, onRemove, onInterval }) {
+  const [url, setUrl] = useState('');
+  const [name, setName] = useState('');
+  const add = (event) => { event.preventDefault(); if (!url.trim()) return; onAdd(url, name); setUrl(''); setName(''); };
+  const totals = monitors.reduce((result, monitor) => { result[monitor.status] = (result[monitor.status] || 0) + 1; return result; }, {});
+  return <div className="about-page monitor-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Workspace</button><ChevronRight size={13} /><span>Uptime monitors</span></div><button className="header-link" onClick={onBack}>Back to projects <ArrowLeft size={14} /></button></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">LIVE URL CHECKS</span><h1>Know when a site responds.</h1><p>Add any public Render or web URL. StackPilot records status, response time, and recent ping history on this device.</p></div>
+    <div className="monitor-stats"><div><strong>{monitors.length}</strong><span>URLs monitored</span></div><div><strong>{totals.up || 0}</strong><span>responding</span></div><div><strong>{totals.down || 0}</strong><span>failing</span></div><div><strong>60s+</strong><span>minimum interval</span></div></div>
+    <form className="monitor-add-card" onSubmit={add}><div className="monitor-add-title"><span className="card-title-icon green"><Wifi size={16} /></span><div><strong>Add a public URL</strong><small>Checks do not send cookies or authentication headers.</small></div></div><div className="monitor-add-fields"><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://your-app.onrender.com/health" aria-label="Public URL to monitor" type="url" required /><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Label (optional)" aria-label="Monitor label" /><button className="primary-button" type="submit"><Plus size={15} /> Add monitor</button></div><p><ShieldCheck size={12} /> Local/private network addresses are blocked. Checks run while this app is open and visible; use an external uptime service if you need monitoring with the browser closed.</p></form>
+    <div className="monitor-list">{monitors.map((monitor) => {
+      const checks = monitor.checks || [];
+      const recent = checks.slice(-100);
+      const uptime = recent.length ? Math.round(recent.filter((check) => check.ok).length / recent.length * 100) : null;
+      const last = checks.at(-1);
+      return <section className="workspace-card monitor-card" key={monitor.id}><div className="monitor-card-head"><span className={`monitor-status-light ${monitor.status}`} /><div className="monitor-card-title"><strong>{monitor.name}</strong><a href={monitor.url} target="_blank" rel="noreferrer">{monitor.url}<ExternalLink size={11} /></a></div><span className={`monitor-status-chip ${monitor.status}`}>{monitor.checking ? 'CHECKING' : monitor.status === 'up' ? 'UP' : monitor.status === 'down' ? 'DOWN' : 'WAITING'}</span><button className="icon-only danger-icon" onClick={() => onRemove(monitor.id)} aria-label={`Remove ${monitor.name}`}><X size={14} /></button></div><div className="monitor-metrics"><div><span>RESPONSE</span><strong>{last ? `${last.durationMs} ms` : '—'}</strong></div><div><span>HTTP</span><strong>{last?.statusCode || '—'}</strong></div><div><span>UPTIME</span><strong>{uptime === null ? '—' : `${uptime}%`}</strong></div><div><span>STATE</span><strong>{monitorStateDuration(monitor)}</strong></div></div><div className="monitor-card-actions"><label>Check interval<select value={monitor.intervalSec || 60} onChange={(event) => onInterval(monitor.id, event.target.value)}><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option></select></label><span>{last ? `Last ping ${timeAgo(last.checkedAt)}${last.error ? ` · ${last.error}` : ''}` : 'No checks yet'}</span><button className="soft-button" onClick={() => onPing(monitor.id)} disabled={monitor.checking}><Radio size={13} /> Ping now</button></div><details className="monitor-log-details"><summary><Activity size={13} /> Recent ping log <span>{checks.length}</span><ChevronDown size={13} /></summary><div className="monitor-log-list">{checks.slice(-20).reverse().map((check, index) => <div className="monitor-log-row" key={`${check.checkedAt}_${index}`}><i className={check.ok ? 'ok' : 'bad'} /><time>{timeLabel(check.checkedAt)}</time><span>{check.ok ? 'Responded' : check.error || 'No response'}</span><strong>{check.statusCode || '—'} · {check.durationMs} ms</strong></div>)}</div></details></section>;
+    })}{!monitors.length && <div className="recent-empty"><strong>No URLs monitored yet</strong><span>Add your deployed URL to start collecting checks while StackPilot is open.</span></div>}</div>
+    <div className="monitor-external-note"><strong>Need checks while StackPilot is closed?</strong><span>Use an external uptime service with this public health endpoint for StackPilot itself: <code>{typeof window !== 'undefined' ? `${window.location.origin}/api/health` : '/api/health'}</code>. No UptimeRobot account is connected here.</span></div>
+  </main></div>;
 }
 
 function DeploymentsPage({ projects, onBack, onOpen }) {
@@ -816,10 +1044,14 @@ function DeploymentsPage({ projects, onBack, onOpen }) {
   return <div className="about-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Projects</button><ChevronRight size={13} /><span>Deployments</span></div></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">RELEASE HISTORY</span><h1>Every deploy, in one place.</h1><p>Render only receives a project after its current GitHub build and tests pass.</p></div>{deployed.length ? <div className="deployment-list">{deployed.map((project) => <button key={project.id} onClick={() => onOpen(project.id)}><span className={`project-dot project-${project.status}`} /><span><strong>{project.name}</strong><small>{project.repo || 'No repository linked'}</small></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span><span className="deployment-url">{project.renderUrl || 'Waiting for first Render deployment'}</span><ArrowUpRight size={15} /></button>)}</div> : <div className="recent-empty"><strong>No releases yet.</strong><span>Start a project and enable Auto-deploy to publish after successful checks.</span></div>}</main></div>;
 }
 
-function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setTokenExpiry, githubIdentity, checkingGithub, checkingRender, onGithubTest, onRenderTest, onSaveGithubToServer, onSave, onEnableNotifications, onDisableNotifications, notificationReady, onClose }) {
+function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setTokenExpiry, githubIdentity, checkingGithub, checkingRender, checkingOpenRouter, onGithubTest, onRenderTest, onOpenRouterTest, onSaveGithubToServer, onSaveOpenRouterKeys, onSaveAppPin, onSave, onEnableNotifications, onDisableNotifications, notificationReady, onClose }) {
   const [serverToken, setServerToken] = useState('');
   const [serverExpiry, setServerExpiry] = useState(tokenExpiry || '');
   const [savingServerToken, setSavingServerToken] = useState(false);
+  const [savingServerOpenRouter, setSavingServerOpenRouter] = useState(false);
+  const [savingServerPin, setSavingServerPin] = useState(false);
+  const [newAppPin, setNewAppPin] = useState('');
+  const [confirmAppPin, setConfirmAppPin] = useState('');
   const update = (key, value) => setConnectors((current) => ({ ...current, [key]: value }));
   const saveServerToken = async () => {
     setSavingServerToken(true);
@@ -827,11 +1059,25 @@ function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setToke
     catch (error) { window.alert(error.message || 'Could not save token.'); }
     finally { setSavingServerToken(false); }
   };
+  const saveOpenRouterKeys = async () => {
+    setSavingServerOpenRouter(true);
+    try { await onSaveOpenRouterKeys(connectors.openRouterKey1, connectors.openRouterKey2); }
+    catch (error) { window.alert(error.message || 'Could not save OpenRouter keys.'); }
+    finally { setSavingServerOpenRouter(false); }
+  };
+  const saveAppPin = async () => {
+    if (newAppPin !== confirmAppPin) { window.alert('The two App PIN fields do not match.'); return; }
+    setSavingServerPin(true);
+    try { await onSaveAppPin(newAppPin); setNewAppPin(''); setConfirmAppPin(''); }
+    catch (error) { window.alert(error.message || 'Could not save the App PIN.'); }
+    finally { setSavingServerPin(false); }
+  };
   return <div className="modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-heading">
     <div className="modal-header"><div className="modal-icon"><Settings2 size={18} /></div><div><h2 id="settings-heading">Settings & connections</h2><p>Use fresh credentials. Secrets never enter project files or the GitHub commit.</p></div><button className="icon-only modal-close" onClick={onClose} aria-label="Close settings"><X size={18} /></button></div>
     <div className="modal-body">
-      {health.authRequired && <div className="settings-card unlock-card"><div className="settings-section-heading"><span className="card-title-icon amber"><LockKeyhole size={15} /></span><div><strong>Workspace password</strong><small>Unlocks protected StackPilot APIs.</small></div></div><label className="settings-field-inline"><span>APP_PASSWORD</span><input type="password" autoComplete="current-password" value={connectors.appPassword} onChange={(event) => update('appPassword', event.target.value)} placeholder="Enter the workspace password" /></label></div>}
-      <div className="settings-card"><div className="settings-section-heading"><span className="card-title-icon violet"><Sparkles size={15} /></span><div><strong>Anthropic / Claude</strong><small>Organizes code and diagnoses real build logs.</small></div><span className={`settings-state ${connectors.anthropicKey || health.envConfigured?.anthropic ? 'ready' : ''}`}>{connectors.anthropicKey || health.envConfigured?.anthropic ? 'READY' : 'ADD KEY'}</span></div><label className="settings-field-inline"><span>Anthropic API key</span><input type="password" autoComplete="new-password" value={connectors.anthropicKey} onChange={(event) => update('anthropicKey', event.target.value)} placeholder="sk-ant-…" /></label><small className="field-help">Can also be set privately as ANTHROPIC_API_KEY in Render environment.</small></div>
+      {health.authRequired && <div className="settings-card unlock-card"><div className="settings-section-heading"><span className="card-title-icon amber"><LockKeyhole size={15} /></span><div><strong>Workspace access code</strong><small>{health.appPinRequired ? 'Enter the four-digit App PIN.' : 'Enter the existing workspace password.'}</small></div></div><label className="settings-field-inline"><span>{health.appPinRequired ? '4-digit APP_PIN' : 'Current workspace password'}</span><input type="password" inputMode={health.appPinRequired ? 'numeric' : 'text'} maxLength={health.appPinRequired ? 4 : undefined} autoComplete="current-password" value={connectors.appPassword} onChange={(event) => update('appPassword', health.appPinRequired ? event.target.value.replace(/\D/g, '').slice(0, 4) : event.target.value)} placeholder={health.appPinRequired ? '••••' : 'Enter the current password'} /></label></div>}
+      <div className="settings-card openrouter-settings-card"><div className="settings-section-heading"><span className="card-title-icon violet"><Sparkles size={15} /></span><div><strong>OpenRouter · free models only</strong><small>Task-focused code organization and targeted repair.</small></div><span className={`settings-state ${connectors.openRouterKey1 || connectors.openRouterKey2 || health.envConfigured?.openrouter ? 'ready' : ''}`}>{connectors.openRouterKey1 || connectors.openRouterKey2 || health.envConfigured?.openrouter ? 'READY' : 'ADD KEY'}</span></div><label className="settings-field-inline"><span>OpenRouter key 1</span><input type="password" autoComplete="new-password" value={connectors.openRouterKey1} onChange={(event) => update('openRouterKey1', event.target.value)} placeholder="sk-or-v1-…" /></label><label className="settings-field-inline"><span>OpenRouter key 2 <small>optional fallback</small></span><input type="password" autoComplete="new-password" value={connectors.openRouterKey2} onChange={(event) => update('openRouterKey2', event.target.value)} placeholder="Second key for rotation" /></label><small className="field-help">Requests are restricted to OpenRouter’s free router; two keys rotate on requests/errors but do not guarantee more quota or uptime. Free models can still return 429s or be unavailable.</small><div className="settings-inline-actions"><button className="soft-button" onClick={onOpenRouterTest} disabled={checkingOpenRouter}>{checkingOpenRouter ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test OpenRouter keys</button><span>Quota check uses the key endpoint, not a model inference.</span></div><details className="server-secret-details"><summary>Save model keys in Render environment</summary><p>Requires a fresh Render API key above. Keys are stored as Render secrets and only the free router is used. Saving queues a service deploy.</p><button className="primary-button save-server-token" onClick={saveOpenRouterKeys} disabled={savingServerOpenRouter || !connectors.openRouterKey1}>{savingServerOpenRouter ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save OpenRouter keys to Render</button></details></div>
+      <div className="settings-card app-pin-settings-card"><div className="settings-section-heading"><span className="card-title-icon amber"><LockKeyhole size={15} /></span><div><strong>Set a four-digit App PIN</strong><small>Writes APP_PIN to Render and queues a restart.</small></div><span className={`settings-state ${health.appPinRequired ? 'ready' : ''}`}>{health.appPinRequired ? 'PIN ON' : 'PASSWORD'}</span></div><div className="pin-field-row"><label className="settings-field-inline"><span>New PIN</span><input type="password" inputMode="numeric" autoComplete="new-password" maxLength="4" value={newAppPin} onChange={(event) => setNewAppPin(event.target.value.replace(/\D/g, '').slice(0, 4))} placeholder="4 digits" /></label><label className="settings-field-inline"><span>Confirm PIN</span><input type="password" inputMode="numeric" autoComplete="new-password" maxLength="4" value={confirmAppPin} onChange={(event) => setConfirmAppPin(event.target.value.replace(/\D/g, '').slice(0, 4))} placeholder="Repeat PIN" /></label></div><small className="field-help">A four-digit PIN is weaker than a passphrase. StackPilot blocks local API brute-force attempts, but Render Free restarts can reset its in-memory limit. A Render API key is required.</small><button className="primary-button save-server-token" onClick={saveAppPin} disabled={savingServerPin || newAppPin.length !== 4 || confirmAppPin.length !== 4}>{savingServerPin ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save PIN in Render</button></div>
       <div className="settings-card"><div className="settings-section-heading"><span className="card-title-icon blue"><Github size={15} /></span><div><strong>GitHub</strong><small>Push code and start the real Actions build runner.</small></div><span className={`settings-state ${connectors.githubToken || health.envConfigured?.github ? 'ready' : ''}`}>{githubIdentity || (health.envConfigured?.github ? 'SERVER KEY' : connectors.githubToken ? 'SESSION KEY' : 'ADD KEY')}</span></div><label className="settings-field-inline"><span>Session token <small>optional if server token is saved</small></span><input type="password" autoComplete="new-password" value={connectors.githubToken} onChange={(event) => update('githubToken', event.target.value)} placeholder="github_pat_…" /></label><div className="settings-inline-actions"><button className="soft-button" onClick={onGithubTest} disabled={checkingGithub}>{checkingGithub ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test GitHub</button><span>Fine-grained token: Contents read/write, Actions read/write, Metadata read.</span></div>
         <details className="server-secret-details"><summary>Save a fresh token in Render environment</summary><p>Stores the token as the private GITHUB_TOKEN environment variable on this StackPilot service. The app restarts after saving. Never use an exposed or revoked token here.</p><label className="settings-field-inline"><span>New GitHub token</span><input type="password" autoComplete="new-password" value={serverToken} onChange={(event) => setServerToken(event.target.value)} placeholder="Paste a newly rotated token" /></label><label className="settings-field-inline"><span>Token expiry date <small>manual reminder</small></span><input type="date" value={serverExpiry} onChange={(event) => setServerExpiry(event.target.value)} /></label><button className="primary-button save-server-token" onClick={saveServerToken} disabled={savingServerToken || !serverToken}>{savingServerToken ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save token securely to Render</button></details>
       </div>
@@ -839,7 +1085,7 @@ function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setToke
       <div className="settings-card notification-settings"><div className="settings-section-heading"><span className="card-title-icon amber"><Bell size={15} /></span><div><strong>Real notifications</strong><small>{health.notificationsConfigured ? 'Web Push is configured on the server.' : 'Notifications need browser permission and server VAPID keys.'}</small></div><span className={`settings-state ${notificationReady ? 'ready' : ''}`}>{notificationReady ? 'ON' : 'DEVICE'}</span></div><button className="soft-button" onClick={notificationReady ? onDisableNotifications : onEnableNotifications}><Bell size={14} />{notificationReady ? 'Disable notifications' : 'Enable notifications'}</button><p className="field-help">On iPhone, add StackPilot to Home Screen first, then allow notifications. Web Push is supported by iOS 16.4+ home-screen web apps.</p></div>
       <div className="privacy-note"><ShieldCheck size={15} /><span>Session keys are kept in this browser tab. Server environment keys are stored by Render. Project environment values are session-only until sent to Render.</span></div>
     </div>
-    <div className="modal-footer"><button className="quiet-button danger-text" onClick={() => { setConnectors((current) => ({ ...current, githubToken: '', renderToken: '', anthropicKey: '' })); }}>Clear session keys</button><div><button className="soft-button" onClick={onClose}>Close</button><button className="primary-button" onClick={onSave}><Check size={15} /> Save session settings</button></div></div>
+    <div className="modal-footer"><button className="quiet-button danger-text" onClick={() => { setConnectors((current) => ({ ...current, githubToken: '', renderToken: '', openRouterKey1: '', openRouterKey2: '' })); }}>Clear session keys</button><div><button className="soft-button" onClick={onClose}>Close</button><button className="primary-button" onClick={onSave}><Check size={15} /> Save session settings</button></div></div>
   </section></div>;
 }
 

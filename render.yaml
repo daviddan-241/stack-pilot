@@ -12,3 +12,21 @@ services:
         value: production
       - key: APP_PASSWORD
         generateValue: true
+      - key: APP_PIN
+        sync: false
+      - key: STACKPILOT_SERVICE_ID
+        sync: false
+      - key: RENDER_OWNER_ID
+        sync: false
+      - key: OPENROUTER_API_KEY_1
+        sync: false
+      - key: OPENROUTER_API_KEY_2
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:you@example.com

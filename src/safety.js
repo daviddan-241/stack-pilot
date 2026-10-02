@@ -1,7 +1,8 @@
 export const SECRET_PATTERNS = [
   /-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----/i,
   /\bsk-ant-api\d+-[A-Za-z0-9_-]{20,}\b/,
-  /\bsk-(?:proj-)?[A-Za-z0-9_-]{24,}\b/,
+  /\bsk-or-v1-[A-Za-z0-9_-]{30,}\b/i,
+  /\bsk-(?!or-v1-)(?:proj-)?[A-Za-z0-9_-]{24,}\b/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
   /\brnd_[A-Za-z0-9_-]{20,}\b/,

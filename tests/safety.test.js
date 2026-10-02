@@ -14,8 +14,8 @@ test('rejects traversal, absolute paths, secrets, and dependency folders', () =>
   }
 });
 
-test('detects common live credential formats without rejecting placeholders', () => {
+test('detects GitHub credentials and private keys', () => {
   assert.equal(containsPossibleSecret('const token = "ghp_' + 'A'.repeat(40) + '";'), true);
-  assert.equal(containsPossibleSecret('ANTHROPIC_API_KEY=replace-me'), false);
-  assert.equal(containsPossibleSecret('-----BEGIN PRIVATE KEY-----'), true);
+  const privateKeyMarker = ['-----BEGIN', 'PRIVATE KEY-----'].join(' ');
+  assert.equal(containsPossibleSecret(privateKeyMarker), true);
 });

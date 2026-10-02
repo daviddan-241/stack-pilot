@@ -1,8 +1,21 @@
-name: StackPilot CI
+name: StackPilot project checks
 on:
   push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Verify the project or run a shell command
+        required: true
+        type: choice
+        options:
+          - verify
+          - shell
+        default: verify
+      command:
+        description: Command for the temporary runner (only used in shell mode)
+        required: false
+        type: string
+        default: npm run build --if-present && npm test --if-present
 permissions:
   contents: read
 jobs:
@@ -15,13 +28,68 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Node
+        if: github.event_name == 'workflow_dispatch' || hashFiles('package.json') != ''
         uses: actions/setup-node@v7
         with:
-          node-version: '20'
-          cache: npm
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-      - name: Run tests
-        run: npm test
-      - name: Build production bundle
-        run: npm run build
+          node-version: '22'
+      - name: Set up Python
+        if: github.event_name == 'push' && (hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != '')
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run requested shell command
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'shell'
+        env:
+          USER_COMMAND: ${{ inputs.command }}
+        run: |
+          if [ -z "$USER_COMMAND" ]; then echo "No command provided"; exit 1; fi
+          echo "$ $USER_COMMAND"
+          bash -lc "$USER_COMMAND"
+      - name: Install, build and test Node project
+        if: github.event_name == 'push' && hashFiles('package.json') != ''
+        run: |
+          npm install --no-audit --no-fund
+          npm run build --if-present
+          npm test --if-present
+      - name: Install and check Python project
+        if: github.event_name == 'push' && (hashFiles('requirements.txt') != '' || hashFiles('pyproject.toml') != '')
+        run: |
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then python -m pip install -e .; fi
+          python -m compileall -q .
+          if [ -d tests ]; then python -m pip install pytest && python -m pytest -q; fi
+      - name: Set up Ruby
+        if: github.event_name == 'push' && (hashFiles('Gemfile') != '' || hashFiles('**/*.rb') != '')
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - name: Run Ruby checks
+        if: github.event_name == 'push' && (hashFiles('Gemfile') != '' || hashFiles('**/*.rb') != '')
+        run: |
+          if [ -f Gemfile ]; then bundle install; fi
+          find . -type f -name '*.rb' -not -path './vendor/*' -print0 | xargs -0 -r -n1 ruby -c
+          if [ -f Rakefile ]; then gem install rake --no-document && rake; fi
+      - name: Set up Elixir
+        if: github.event_name == 'push' && hashFiles('mix.exs') != ''
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: '1.18'
+          otp-version: '27'
+      - name: Run Elixir checks
+        if: github.event_name == 'push' && hashFiles('mix.exs') != ''
+        run: mix local.hex --force && mix deps.get && mix test && mix compile --warnings-as-errors
+      - name: Set up Rust
+        if: github.event_name == 'push' && hashFiles('Cargo.toml') != ''
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Rust checks
+        if: github.event_name == 'push' && hashFiles('Cargo.toml') != ''
+        run: cargo test --workspace && cargo build --workspace
+      - name: Report static project
+        if: github.event_name == 'push' && hashFiles('package.json') == '' && hashFiles('requirements.txt') == '' && hashFiles('pyproject.toml') == '' && hashFiles('go.mod') == '' && hashFiles('Gemfile') == '' && hashFiles('**/*.rb') == '' && hashFiles('mix.exs') == '' && hashFiles('Cargo.toml') == ''
+        run: |
+          if [ -f index.html ] || find . -maxdepth 4 -type f -name '*.html' -print -quit | grep -q .; then
+            echo "Static HTML project detected; ready for Static Site hosting."
+          else
+            echo "No supported project check runner matched these files. Add a supported build manifest or run a command from StackPilot's remote shell." >&2
+            exit 1
+          fi

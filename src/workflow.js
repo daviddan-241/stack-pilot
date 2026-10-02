@@ -1,5 +1,7 @@
+import { isBinaryAsset } from './projectFiles.js';
+
 export const STEPS = [
-  { id: 'organize', label: 'Architect', role: 'Project Architect', detail: 'Maps the dump into a clean, runnable project.' },
+  { id: 'organize', label: 'Architect', role: 'OpenRouter Free Architect', detail: 'Uses the free router only when a pasted brief needs structure.' },
   { id: 'preflight', label: 'Safety', role: 'Safety & Build Guard', detail: 'Checks paths, secrets, imports, and setup.' },
   { id: 'github', label: 'Release', role: 'GitHub Release Agent', detail: 'Commits the verified project and workflow.' },
   { id: 'runner', label: 'Build', role: 'Build & Test Agent', detail: 'Runs real tests and production build in GitHub Actions.' },
@@ -20,6 +22,7 @@ export function calculateProgress(steps = {}, status = '', reported = null) {
 export function detectEnvKeys(files = {}) {
   const found = new Set();
   const envExample = /(?:^|\/)(?:\.env(?:\.(?:example|sample|template|development|production))?|env\.example)$/i;
+  const openRouterEnvPattern = /\b(OPENROUTER_API_KEY(?:_[12])?|OPENROUTER_MODEL|OPENROUTER_SITE_URL)\b/g;
   const keyPatterns = [
     /^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=/gm,
     /\bprocess\.env\.([A-Z][A-Z0-9_]*)/g,
@@ -29,6 +32,8 @@ export function detectEnvKeys(files = {}) {
     /\bENV\[['"]([A-Z][A-Z0-9_]*)['"]\]/g,
   ];
   for (const [path, content] of Object.entries(files)) {
+    if (isBinaryAsset(content)) continue;
+    for (const match of String(content).matchAll(openRouterEnvPattern)) found.add(match[1]);
     if (envExample.test(path)) {
       for (const match of String(content).matchAll(/^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=/gm)) found.add(match[1]);
     }

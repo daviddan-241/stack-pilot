@@ -3,13 +3,21 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { timingSafeEqual, randomUUID } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import AdmZip from 'adm-zip';
 import webpush from 'web-push';
 import { containsPossibleSecret, validateRelativePath } from './src/safety.js';
+import { errorMessageForModelStatus, isOpenRouterRetryableStatus, normalizeFreeModel, normalizeOpenRouterKeys } from './src/openrouter.js';
+import { isPrivateOrReservedAddress, normalizeMonitorUrl } from './src/monitor.js';
+import { binaryAssetByteLength, encodeBinaryAsset, isBinaryAsset, parseBinaryAsset } from './src/projectFiles.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+let openRouterKeyCursor = 0;
+const authFailures = new Map();
+if (process.env.APP_PIN && !/^\d{4}$/.test(process.env.APP_PIN)) throw new Error('APP_PIN must be exactly four digits.');
 const BODY_LIMIT = '12mb';
 const GH_API = 'https://api.github.com';
 const RENDER_API = 'https://api.render.com/v1';
@@ -18,6 +26,7 @@ const pushSubscriptions = new Map();
 const notifiedExpiryDays = new Set();
 const JOB_RETENTION_MS = 12 * 60 * 60 * 1000;
 const MAX_JOB_LOGS = 300;
+const BINARY_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', ico: 'image/x-icon', bmp: 'image/bmp', woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf', pdf: 'application/pdf', mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', mp4: 'video/mp4', webm: 'video/webm' };
 const vapidConfigured = Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
 if (vapidConfigured) {
   webpush.setVapidDetails(
@@ -42,27 +51,39 @@ function safeEqual(a, b) {
   return left.length === right.length && left.length > 0 && timingSafeEqual(left, right);
 }
 
-// When deployed publicly, set APP_PASSWORD in Render. The password is checked on
-// every API call and is never stored by this server.
+function configuredAppSecret() { return process.env.APP_PIN || process.env.APP_PASSWORD || ''; }
+
+// Rate-limit failed PIN/password attempts in-process. Render restarts can clear
+// this map; a short PIN is still weaker than a long passphrase.
 app.use('/api', (req, res, next) => {
-  if (req.path === '/health' || !process.env.APP_PASSWORD) return next();
+  if (req.path === '/health' || !configuredAppSecret()) return next();
+  const client = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const record = authFailures.get(client);
+  if (record?.blockedUntil > now) return res.status(429).json({ error: 'Too many incorrect workspace codes. Wait ten minutes and try again.' });
   const supplied = req.get('x-app-password') || '';
-  if (!safeEqual(process.env.APP_PASSWORD, supplied)) {
-    return res.status(401).json({ error: 'Workspace locked. Enter the app password in Settings.' });
+  if (!safeEqual(configuredAppSecret(), supplied)) {
+    const current = record?.windowUntil > now ? record : { attempts: 0, windowUntil: now + 10 * 60 * 1000, blockedUntil: 0 };
+    current.attempts += 1;
+    if (current.attempts >= 8) current.blockedUntil = now + 10 * 60 * 1000;
+    authFailures.set(client, current);
+    return res.status(current.blockedUntil ? 429 : 401).json({ error: current.blockedUntil ? 'Too many incorrect workspace codes. Wait ten minutes and try again.' : 'Workspace locked. Enter the app code in Settings.' });
   }
+  authFailures.delete(client);
   next();
 });
 
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    authRequired: Boolean(process.env.APP_PASSWORD),
+    authRequired: Boolean(configuredAppSecret()),
+    appPinRequired: Boolean(process.env.APP_PIN),
     mode: process.env.NODE_ENV === 'production' ? 'cloud' : 'development',
     persistence: 'browser-local-and-github-actions',
     envConfigured: {
       github: Boolean(process.env.GITHUB_TOKEN),
       render: Boolean(process.env.RENDER_API_TOKEN),
-      anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+      openrouter: Boolean(process.env.OPENROUTER_API_KEY_1 || process.env.OPENROUTER_API_KEY_2 || process.env.OPENROUTER_API_KEY),
     },
     renderOwnerId: process.env.RENDER_OWNER_ID || '',
     notificationsConfigured: vapidConfigured,
@@ -87,79 +108,121 @@ function normalizeFiles(input, { maxFiles = 300, maxTotal = 3_000_000 } = {}) {
   for (const [rawPath, rawContent] of entries) {
     const filePath = rawPath.trim().replaceAll('\\', '/');
     if (!validateRelativePath(filePath)) throw httpError(`Unsafe or unsupported file path: ${rawPath}`);
-    if (typeof rawContent !== 'string') throw httpError(`File contents must be text: ${rawPath}`);
-    const bytes = Buffer.byteLength(rawContent, 'utf8');
+    if (typeof rawContent !== 'string') throw httpError(`File contents must be text or a validated binary asset: ${rawPath}`);
+    let bytes;
+    if (isBinaryAsset(rawContent)) {
+      const parsed = parseBinaryAsset(rawContent);
+      bytes = binaryAssetByteLength(rawContent);
+      if (!parsed || bytes < 0) throw httpError(`Binary asset encoding is invalid: ${rawPath}`);
+    } else bytes = Buffer.byteLength(rawContent, 'utf8');
     if (bytes > 750_000) throw httpError(`File is too large: ${rawPath}`);
     total += bytes;
-    if (total > maxTotal) throw httpError('Project is too large to process in one pass (3 MB limit).');
+    if (total > maxTotal) throw httpError('Project is too large to process in one pass (3 MB total raw file limit).');
     out[filePath] = rawContent;
   }
   return out;
 }
 
-async function callClaude({ apiKey, model, system, user, maxTokens = 12000 }) {
-  if (!apiKey || typeof apiKey !== 'string' || apiKey.length < 10) {
-    throw httpError('Add a valid Anthropic API key in Connectors to use Claude.');
+async function callOpenRouter({ apiKeys, model, system, user, maxTokens = 7000 }) {
+  const keys = normalizeOpenRouterKeys([
+    ...(Array.isArray(apiKeys) ? apiKeys : []),
+    process.env.OPENROUTER_API_KEY_1,
+    process.env.OPENROUTER_API_KEY_2,
+    process.env.OPENROUTER_API_KEY,
+  ]);
+  if (!keys.length) throw httpError('Add one or two OpenRouter keys in Settings to use the $0 free-model router.');
+  const selectedModel = normalizeFreeModel(model || process.env.OPENROUTER_MODEL);
+  const startIndex = openRouterKeyCursor % keys.length;
+  openRouterKeyCursor = (openRouterKeyCursor + 1) % keys.length;
+  let lastStatus = 503;
+
+  for (let attempt = 0; attempt < keys.length; attempt += 1) {
+    const key = keys[(startIndex + attempt) % keys.length];
+    let response;
+    try {
+      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${key}`,
+          'http-referer': process.env.OPENROUTER_SITE_URL || 'https://stack-pilot-builder.onrender.com',
+          'x-title': 'StackPilot',
+        },
+        body: JSON.stringify({
+          model: selectedModel,
+          temperature: 0.1,
+          max_tokens: maxTokens,
+          response_format: { type: 'json_object' },
+          messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        }),
+        signal: AbortSignal.timeout(120_000),
+      });
+    } catch (error) {
+      lastStatus = 503;
+      if (attempt + 1 < keys.length) continue;
+      throw httpError('OpenRouter could not be reached. No paid model was selected; check connectivity and retry.', 503);
+    }
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      lastStatus = response.status;
+      if (!isOpenRouterRetryableStatus(response.status)) {
+        const detail = String(data?.error?.message || '').slice(0, 240);
+        throw httpError(`OpenRouter request failed${detail ? `: ${detail}` : ` (HTTP ${response.status})`}.`, response.status >= 500 ? 502 : 400);
+      }
+      if (response.status === 429 && attempt + 1 < keys.length) {
+        const retryAfter = Math.min(1500, Math.max(0, Number(response.headers.get('retry-after') || 0) * 1000));
+        if (retryAfter) await new Promise((resolve) => setTimeout(resolve, retryAfter));
+      }
+      continue;
+    }
+    const content = data?.choices?.[0]?.message?.content;
+    const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((part) => part.text || '').join('\n') : '';
+    if (text.trim()) return text;
+    lastStatus = 502;
   }
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: model || 'claude-sonnet-5-5',
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: 'user', content: user }],
-    }),
-    signal: AbortSignal.timeout(180_000),
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = data?.error?.message || `Anthropic returned HTTP ${response.status}.`;
-    throw httpError(`Claude request failed: ${message}`, response.status >= 500 ? 502 : 400);
-  }
-  const text = (data?.content || []).filter((block) => block.type === 'text').map((block) => block.text).join('\n');
-  if (!text) throw httpError('Claude returned an empty response. Try a smaller code dump.', 502);
-  return text;
+  throw httpError(`${errorMessageForModelStatus(lastStatus)} Free models have shared, limited quotas; rotating two keys cannot guarantee extra quota.`, 503);
 }
 
 function parseJsonResponse(text) {
   const cleaned = text.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
-  if (start < 0 || end < start) throw httpError('Claude did not return the expected project JSON. Try again.', 502);
+  if (start < 0 || end < start) throw httpError('OpenRouter did not return the expected project JSON. Try again with a shorter request.', 502);
   try {
     return JSON.parse(cleaned.slice(start, end + 1));
   } catch {
-    throw httpError('Claude returned malformed JSON for the file map. Try again or use a smaller code dump.', 502);
+    throw httpError('OpenRouter returned malformed JSON for the file map. Try a smaller code dump or retry the free model.', 502);
   }
 }
 
 app.post('/api/organize', async (req, res, next) => {
   try {
     const { input, projectName, model } = req.body || {};
-    const apiKey = req.body?.apiKey || process.env.ANTHROPIC_API_KEY;
-    if (typeof input !== 'string' || !input.trim()) throw httpError('Paste some code or a project brief first.');
-    if (input.length > 100_000) throw httpError('That code dump is over 100,000 characters. Split it into smaller pieces first.');
-    if (containsPossibleSecret(input)) throw httpError('This code dump appears to contain a live credential. Remove or rotate it before sending source to Claude.');
+    const apiKeys = normalizeOpenRouterKeys(req.body?.apiKeys || [req.body?.apiKey1, req.body?.apiKey2]);
+    const suppliedFiles = req.body?.files && Object.keys(req.body.files).length ? normalizeFiles(req.body.files) : {};
+    const modelFiles = Object.fromEntries(Object.entries(suppliedFiles).filter(([, content]) => !isBinaryAsset(content)));
+    if (typeof input !== 'string' || !input.trim()) throw httpError('Add a short project brief or code dump first.');
+    if (input.length > 40_000) throw httpError('Keep the project prompt under 40,000 characters to preserve free-model context.');
+    if (containsPossibleSecret(input) || Object.values(modelFiles).some(containsPossibleSecret)) throw httpError('A live credential was detected. Remove or rotate it before sending source to OpenRouter.');
+    const sourceBytes = Object.values(modelFiles).reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0);
+    if (sourceBytes > 60_000) throw httpError('This project is too large for the free-model organize step (60 KB source limit). Use the ZIP/repository import, edit the files, and run the GitHub checks directly.');
     const system = [
-      'You are StackPilot, a careful senior engineer that converts a pasted code dump into a coherent, runnable project.',
-      'Return ONLY strict JSON with this exact top-level shape: {"files":{"relative/path":"full file contents"},"summary":"short description","stack":"detected stack","deployType":"web_service or static_site","runtime":"node, python, ruby, go, or elixir","buildCommand":"... or empty","startCommand":"... or empty","publishPath":"dist, public, or .","testCommand":"... or empty","notes":["..." ]}.',
-      'Preserve all valid supplied code and clearly labelled filenames. Organize unlabeled code into sensible files. Finish obviously incomplete syntax and missing minimal project setup only when the intent is unambiguous.',
-      'Do not invent API keys, passwords, production data, or unspecified business behavior. Use clearly named environment-variable placeholders instead. Never create .env files, secrets, credentials, node_modules, or binary files.',
-      'Choose static_site for a client-only HTML/CSS/JS or Vite/React frontend (publishPath dist for Vite, . for plain root HTML); choose web_service for an app that needs a persistent server process. Set runtime and build/start commands to match actual files, not guesses. Include the dependencies and scripts needed to build/start the detected app. Prefer common, stable project conventions. Keep file paths relative and use forward slashes.',
-      'If something cannot safely be inferred, leave a TODO and explain it in notes. The result must be valid JSON; escape newlines and quotes inside strings.',
+      'You are StackPilot, a concise senior software engineer. Convert the user brief and any supplied source files into a coherent, runnable project.',
+      'Return strict JSON with this shape: {"files":{"relative/path":"full file contents"},"summary":"short description","stack":"detected stack","deployType":"web_service or static_site","runtime":"node, python, ruby, go, or elixir","buildCommand":"... or empty","startCommand":"... or empty","publishPath":"dist, public, or .","testCommand":"... or empty","notes":["..." ]}.',
+      'If existing files are supplied, preserve them and return only files that need to be added or changed. If no files are supplied, return the full minimal project. Preserve the intended behavior and finish only obvious gaps; never invent unrequested business logic.',
+      'Use environment-variable placeholders only. Never create real credentials, .env secrets, production data, dependency folders, or binary files. Keep relative paths safe and use forward slashes.',
+      'Choose the runtime, build command, start command, and static/web-service type from the actual project. Prefer small dependency sets and standard scripts to conserve free model output.',
+      'Be accurate about assumptions and leave a short TODO when a required decision cannot be inferred. Do not claim tests or deployments have run. Output valid JSON only.',
     ].join('\n');
-    const user = `Project name: ${String(projectName || 'new-project').slice(0, 80)}\n\nCode dump / instructions:\n${input}`;
-    const raw = await callClaude({ apiKey, model, system, user, maxTokens: 16000 });
+    const fileContext = Object.keys(modelFiles).length ? `\n\nCurrent text source files (JSON; return only changed/new files):\n${JSON.stringify(modelFiles)}` : '';
+    const user = `Project name: ${String(projectName || 'new-project').slice(0, 80)}\n\nTask / code dump:\n${input}${fileContext}`;
+    const raw = await callOpenRouter({ apiKeys, model, system, user, maxTokens: Object.keys(modelFiles).length ? 5000 : 7000 });
     const parsed = parseJsonResponse(raw);
-    const files = normalizeFiles(parsed.files);
+    const files = parsed.files && Object.keys(parsed.files).length ? normalizeFiles(parsed.files) : {};
+    if (!Object.keys(files).length && !Object.keys(suppliedFiles).length) throw httpError('The free model returned no files. Retry once or use the ZIP import path.', 502);
     res.json({
       files,
-      summary: String(parsed.summary || 'Project files organized by Claude.').slice(0, 1200),
+      summary: String(parsed.summary || 'Project files reviewed by the free OpenRouter model.').slice(0, 1200),
       stack: String(parsed.stack || 'Detected from source').slice(0, 120),
       deployType: parsed.deployType === 'static_site' ? 'static_site' : 'web_service',
       runtime: ['node', 'python', 'ruby', 'go', 'elixir'].includes(parsed.runtime) ? parsed.runtime : 'node',
@@ -175,25 +238,26 @@ app.post('/api/organize', async (req, res, next) => {
 app.post('/api/repair', async (req, res, next) => {
   try {
     const { files: originalFiles, errors, model } = req.body || {};
-    const apiKey = req.body?.apiKey || process.env.ANTHROPIC_API_KEY;
+    const apiKeys = normalizeOpenRouterKeys(req.body?.apiKeys || [req.body?.apiKey1, req.body?.apiKey2]);
     const files = normalizeFiles(originalFiles);
-    if (Object.values(files).some(containsPossibleSecret)) throw httpError('A project file appears to contain a live credential. Remove or rotate it before asking Claude to inspect these files.');
-    if (!apiKey) throw httpError('Add your Anthropic key to run an automatic repair.');
+    const textFiles = Object.fromEntries(Object.entries(files).filter(([, content]) => !isBinaryAsset(content)));
+    if (Object.values(textFiles).some(containsPossibleSecret)) throw httpError('A project file appears to contain a live credential. Remove or rotate it before sending source to OpenRouter.');
+    if (!Object.keys(files).length || Object.values(textFiles).reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0) > 60_000) throw httpError('Free-model repairs are limited to projects with at most 60 KB of text source.');
     if (typeof errors !== 'string' || !errors.trim()) throw httpError('No build or test error log was supplied.');
-    if (errors.length > 45_000) throw httpError('Error log is too large; keep the last 45,000 characters.');
-    if (containsPossibleSecret(errors)) throw httpError('The error log appears to contain a live credential. Rotate it and remove the secret before sharing logs with Claude.');
+    if (errors.length > 20_000) throw httpError('Error log is too large; keep the last 20,000 characters to conserve free-model quota.');
+    if (containsPossibleSecret(errors)) throw httpError('The error log appears to contain a live credential. Rotate it before sharing logs with OpenRouter.');
     const system = [
-      'You are StackPilot, a cautious build-failure repair agent.',
-      'Inspect the project files and the supplied build/test logs. Fix only problems supported by the evidence. Preserve the intended behavior and do not add secrets.',
-      'Return ONLY strict JSON shaped as {"files":{"relative/path":"full updated file contents"},"summary":"what changed","notes":["remaining caveats"]}. Include every changed or newly created file in full; do not include unchanged files.',
-      'Use only safe relative paths. Do not create .env, credentials, binary artifacts, or node_modules. JSON-escape code correctly.',
+      'You are StackPilot, a focused build-failure repair engineer.',
+      'Use the supplied files and real build/test logs. Make the smallest evidence-based fix; preserve intended behavior. Do not add secrets or unrelated features.',
+      'Return strict JSON shaped as {"files":{"relative/path":"full updated file contents"},"summary":"what changed","notes":["remaining caveats"]}. Include changed/new files only.',
+      'Use safe relative paths. Never create .env secrets, credentials, binary artifacts, or dependency folders. Do not claim the repair passed until the runner verifies it. Output valid JSON only.',
     ].join('\n');
-    const user = `Build/test error log:\n${errors}\n\nCurrent project files (JSON):\n${JSON.stringify(files)}`;
-    const raw = await callClaude({ apiKey, model, system, user, maxTokens: 12000 });
+    const user = `Build/test error log:\n${errors.slice(-20_000)}\n\nCurrent text source files (JSON; binary assets are preserved outside the model call):\n${JSON.stringify(textFiles)}`;
+    const raw = await callOpenRouter({ apiKeys, model, system, user, maxTokens: 4500 });
     const parsed = parseJsonResponse(raw);
     const changed = parsed.files && Object.keys(parsed.files).length ? normalizeFiles(parsed.files) : {};
-    if (!Object.keys(changed).length) throw httpError('Claude could not identify a concrete repair from these logs.', 422);
-    res.json({ files: changed, summary: String(parsed.summary || 'Applied a targeted repair.').slice(0, 1200), notes: Array.isArray(parsed.notes) ? parsed.notes.slice(0, 12) : [] });
+    if (!Object.keys(changed).length) throw httpError('The free model could not identify a concrete repair from these logs.', 422);
+    res.json({ files: changed, summary: String(parsed.summary || 'Applied a targeted fix suggestion.').slice(0, 1200), notes: Array.isArray(parsed.notes) ? parsed.notes.slice(0, 12) : [] });
   } catch (error) { next(error); }
 });
 
@@ -202,13 +266,13 @@ function inspectProject(files) {
   let totalBytes = 0;
   for (const [filePath, content] of Object.entries(files)) {
     if (!validateRelativePath(filePath)) findings.push({ severity: 'error', message: `Unsafe path: ${filePath}` });
-    totalBytes += Buffer.byteLength(content, 'utf8');
-    if (containsPossibleSecret(content)) {
+    totalBytes += isBinaryAsset(content) ? Math.max(0, binaryAssetByteLength(content)) : Buffer.byteLength(content, 'utf8');
+    if (!isBinaryAsset(content) && containsPossibleSecret(content)) {
       findings.push({ severity: 'error', message: `Possible live secret detected in ${filePath}; remove it before sending or committing this file.` });
     }
   }
   if (Object.keys(files).length > 300) findings.push({ severity: 'error', message: 'Project has more than 300 files.' });
-  if (totalBytes > 3_000_000) findings.push({ severity: 'error', message: 'Project exceeds the 3 MB text limit.' });
+  if (totalBytes > 3_000_000) findings.push({ severity: 'error', message: 'Project exceeds the 3 MB total file limit.' });
 
   let pkg = null;
   if (files['package.json']) {
@@ -368,6 +432,18 @@ function parseGithubRepo(input) {
   return { owner: parts[0], repo: parts[1] };
 }
 
+async function mapLimit(items, limit, handler) {
+  const result = new Array(items.length);
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      result[index] = await handler(items[index], index);
+    }
+  }));
+  return result;
+}
+
 async function githubRequest(token, endpoint, options = {}) {
   const response = await fetch(`${GH_API}${endpoint}`, {
     ...options,
@@ -391,12 +467,82 @@ async function githubRequest(token, endpoint, options = {}) {
   return { data, response };
 }
 
+app.post('/api/openrouter/test', async (req, res, next) => {
+  try {
+    const keys = normalizeOpenRouterKeys(req.body?.apiKeys || [req.body?.key1, req.body?.key2, process.env.OPENROUTER_API_KEY_1, process.env.OPENROUTER_API_KEY_2, process.env.OPENROUTER_API_KEY]);
+    if (!keys.length) throw httpError('Enter at least one OpenRouter key first.');
+    let lastStatus = 401;
+    for (const key of keys) {
+      const response = await fetch('https://openrouter.ai/api/v1/key', { headers: { authorization: `Bearer ${key}`, accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
+      const body = await response.json().catch(() => ({}));
+      if (response.ok) {
+        const info = body.data || body;
+        return res.json({ ok: true, label: info.label || '', isFreeTier: Boolean(info.is_free_tier), remainingFreeRequests: info.free_model_daily_requests?.remaining ?? null, freeRequestLimit: info.free_model_daily_requests?.limit ?? null, message: 'OpenRouter key accepted. The free model router can still be rate-limited or temporarily unavailable.' });
+      }
+      lastStatus = response.status;
+      if (response.status !== 401 && response.status !== 429) break;
+    }
+    throw httpError(lastStatus === 429 ? 'OpenRouter key check is rate-limited. Wait and retry.' : 'OpenRouter did not accept either key. Check the key values and account access.', lastStatus === 401 ? 401 : 502);
+  } catch (error) { next(error); }
+});
+
 app.post('/api/github/me', async (req, res, next) => {
   try {
     const token = req.body?.token || process.env.GITHUB_TOKEN;
     if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
     const { data } = await githubRequest(token, '/user');
     res.json({ login: data.login, avatarUrl: data.avatar_url, htmlUrl: data.html_url });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/github/import', async (req, res, next) => {
+  try {
+    const token = req.body?.token || process.env.GITHUB_TOKEN;
+    if (!token) throw httpError('Add a GitHub token in Settings before importing a repository.');
+    const { owner, repo } = parseGithubRepo(req.body?.repository);
+    const { data: repoInfo } = await githubRequest(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
+    const branch = String(req.body?.branch || repoInfo.default_branch || 'main').trim();
+    if (!/^[A-Za-z0-9._/-]{1,100}$/.test(branch) || branch.includes('..')) throw httpError('Invalid branch name.');
+    const refPath = branch.split('/').map(encodeURIComponent).join('/');
+    const { data: ref } = await githubRequest(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${refPath}`);
+    const { data: treeData } = await githubRequest(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(ref.object.sha)}?recursive=1`);
+    if (treeData.truncated) throw httpError('This repository is too large to import in one pass. Use its ZIP download and keep source files under the project limit.', 413);
+    const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.venv', 'vendor', '__pycache__']);
+    const blobs = (treeData.tree || []).filter((entry) => entry.type === 'blob' && entry.size <= 750_000 && validateRelativePath(entry.path) && !entry.path.split('/').some((part) => ignored.has(part.toLowerCase()))).slice(0, 301);
+    if (blobs.length > 300) throw httpError('Repository has more than 300 importable source files. Reduce generated/dependency content and retry.', 413);
+    const files = {};
+    let totalBytes = 0;
+    let skipped = (treeData.tree || []).length - blobs.length;
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(8, blobs.length) }, async () => {
+      while (cursor < blobs.length) {
+        const index = cursor++;
+        const entry = blobs[index];
+        const { data: blob } = await githubRequest(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs/${encodeURIComponent(entry.sha)}`);
+        if (blob.encoding !== 'base64' || !blob.content) { skipped += 1; continue; }
+        const bytes = Buffer.from(blob.content.replace(/\s/g, ''), 'base64');
+        const extension = entry.path.split('.').at(-1)?.toLowerCase();
+        const mime = BINARY_MIME[extension];
+        if (mime) {
+          if (bytes.length > 750_000) { skipped += 1; continue; }
+          totalBytes += bytes.length;
+          if (totalBytes > 3_000_000) throw httpError('Repository source exceeds the 3 MB total file limit. Use a smaller branch or remove generated files.', 413);
+          files[entry.path] = encodeBinaryAsset(bytes, mime);
+          continue;
+        }
+        if (bytes.includes(0)) { skipped += 1; continue; }
+        let text;
+        try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+        catch { skipped += 1; continue; }
+        if (containsPossibleSecret(text)) throw httpError(`A possible live credential is present in ${entry.path}. Remove or rotate it before importing.`, 422);
+        totalBytes += bytes.length;
+        if (totalBytes > 3_000_000) throw httpError('Repository source exceeds the 3 MB total file limit. Use a smaller branch or remove generated files.', 413);
+        files[entry.path] = text;
+      }
+    });
+    await Promise.all(workers);
+    const normalized = normalizeFiles(files);
+    res.json({ repository: `${owner}/${repo}`, branch, defaultBranch: repoInfo.default_branch || branch, files: normalized, count: Object.keys(normalized).length, skipped, url: repoInfo.html_url || `https://github.com/${owner}/${repo}` });
   } catch (error) { next(error); }
 });
 
@@ -407,7 +553,7 @@ app.post('/api/github/push', async (req, res, next) => {
     if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
     const { owner, repo } = parseGithubRepo(repository);
     const files = normalizeFiles(rawFiles);
-    if (Object.values(files).some(containsPossibleSecret)) throw httpError('A project file appears to contain a live credential. Remove or rotate it before pushing to GitHub.');
+    if (Object.values(files).some((content) => !isBinaryAsset(content) && containsPossibleSecret(content))) throw httpError('A project file appears to contain a live credential. Remove or rotate it before pushing to GitHub.');
     const workflowPath = '.github/workflows/stackpilot-ci.yml';
     const workflowContent = stackPilotWorkflow();
     files[workflowPath] = workflowContent;
@@ -466,7 +612,12 @@ app.post('/api/github/push', async (req, res, next) => {
       baseTree = parentCommit.tree.sha;
       parents.push(parentSha);
     }
-    const tree = Object.entries(files).map(([filePath, content]) => ({ path: filePath, mode: '100644', type: 'blob', content }));
+    const tree = await mapLimit(Object.entries(files), 8, async ([filePath, content]) => {
+      if (!isBinaryAsset(content)) return { path: filePath, mode: '100644', type: 'blob', content };
+      const asset = parseBinaryAsset(content);
+      const { data: blob } = await githubRequest(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/blobs`, { method: 'POST', body: JSON.stringify({ content: asset.base64, encoding: 'base64' }) });
+      return { path: filePath, mode: '100644', type: 'blob', sha: blob.sha };
+    });
     const treeBody = { tree };
     if (baseTree) treeBody.base_tree = baseTree;
     const { data: nextTree } = await githubRequest(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees`, {
@@ -560,7 +711,7 @@ app.post('/api/github/runs', async (req, res, next) => {
 
 function normalizeRenderEnvVars(envVars, { protectOwnService = false } = {}) {
   if (!Array.isArray(envVars) || envVars.length > 30) throw httpError('Supply up to 30 environment variables.');
-  const reserved = protectOwnService ? ['PORT', 'APP_PASSWORD', 'RENDER_API_TOKEN', 'GITHUB_TOKEN', 'GITHUB_TOKEN_EXPIRES_AT', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY', 'STACKPILOT_SERVICE_ID'] : ['PORT'];
+  const reserved = protectOwnService ? ['PORT', 'APP_PASSWORD', 'APP_PIN', 'RENDER_API_TOKEN', 'GITHUB_TOKEN', 'GITHUB_TOKEN_EXPIRES_AT', 'OPENROUTER_API_KEY_1', 'OPENROUTER_API_KEY_2', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY', 'STACKPILOT_SERVICE_ID'] : ['PORT'];
   const output = envVars.map((item) => ({ key: String(item?.key || '').trim(), value: String(item?.value ?? '') })).filter((item) => item.key);
   for (const item of output) {
     if (!/^[A-Z_][A-Z0-9_]{0,99}$/.test(item.key)) throw httpError(`Invalid environment variable name: ${item.key}`);
@@ -595,6 +746,17 @@ app.post('/api/render/test', async (req, res, next) => {
     if (!token) throw httpError('Add a Render API key in Connectors or configure RENDER_API_TOKEN on the server.');
     const data = await renderRequest(token, '/services?limit=1');
     res.json({ ok: true, message: 'Render API key accepted.', visibleServices: Array.isArray(data) ? data.length : 0 });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/render/disable-autodeploy', async (req, res, next) => {
+  try {
+    const token = req.body?.token || process.env.RENDER_API_TOKEN;
+    const serviceId = String(req.body?.serviceId || '').trim();
+    if (!token) throw httpError('Add a Render API key before using an existing service with GitHub checks.');
+    if (!serviceId || serviceId.length > 120) throw httpError('Enter a valid existing Render service ID.');
+    const data = await renderRequest(token, `/services/${encodeURIComponent(serviceId)}`, { method: 'PATCH', body: JSON.stringify({ autoDeployTrigger: 'off' }) });
+    res.json({ ok: true, autoDeployTrigger: data.autoDeployTrigger || 'off' });
   } catch (error) { next(error); }
 });
 
@@ -716,6 +878,52 @@ app.post('/api/render/logs', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+async function validatePublicMonitorUrl(value) {
+  let url;
+  try { url = new URL(normalizeMonitorUrl(value)); }
+  catch (error) { throw httpError(error.message || 'Enter a public HTTP(S) URL.'); }
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  if (isIP(host)) {
+    if (isPrivateOrReservedAddress(host)) throw httpError('Monitoring private or local network addresses is blocked.');
+    return url;
+  }
+  let addresses;
+  try { addresses = await lookup(host, { all: true, verbatim: true }); }
+  catch { throw httpError('The monitor hostname did not resolve to a public address.'); }
+  if (!addresses.length || addresses.some((row) => isPrivateOrReservedAddress(row.address))) throw httpError('The monitor hostname resolves to a private or reserved network address.');
+  return url;
+}
+
+app.post('/api/monitor/ping', async (req, res, next) => {
+  const started = performance.now();
+  const checkedAt = new Date().toISOString();
+  try {
+    let current = await validatePublicMonitorUrl(req.body?.url);
+    for (let hop = 0; hop <= 3; hop += 1) {
+      current = await validatePublicMonitorUrl(current.toString());
+      let response;
+      try {
+        response = await fetch(current, {
+          method: 'GET', redirect: 'manual', headers: { 'user-agent': 'StackPilot-Uptime-Monitor/1.0', accept: '*/*' },
+          signal: AbortSignal.timeout(8000),
+        });
+      } catch (error) {
+        return res.json({ ok: false, statusCode: 0, durationMs: Math.round(performance.now() - started), checkedAt, error: error.name === 'TimeoutError' ? 'Timed out after 8 seconds.' : 'The URL could not be reached.' });
+      }
+      if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+        await response.body?.cancel().catch(() => {});
+        if (hop === 3) return res.json({ ok: false, statusCode: response.status, durationMs: Math.round(performance.now() - started), checkedAt, error: 'The URL redirected too many times.' });
+        current = new URL(response.headers.get('location'), current);
+        continue;
+      }
+      const statusCode = response.status;
+      await response.body?.cancel().catch(() => {});
+      return res.json({ ok: statusCode >= 200 && statusCode < 400, statusCode, durationMs: Math.round(performance.now() - started), checkedAt, error: statusCode >= 400 ? `HTTP ${statusCode}` : '' });
+    }
+    return res.json({ ok: false, statusCode: 0, durationMs: Math.round(performance.now() - started), checkedAt, error: 'Redirect check failed.' });
+  } catch (error) { next(error); }
+});
+
 function appendJobLog(job, text, level = 'info', source = 'StackPilot') {
   job.sequence += 1;
   job.logs.push({ id: job.sequence, time: new Date().toISOString(), level, source, text: String(text).slice(0, 3000) });
@@ -767,7 +975,7 @@ function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 async function internalPost(endpoint, payload) {
   const headers = { 'content-type': 'application/json' };
-  if (process.env.APP_PASSWORD) headers['x-app-password'] = process.env.APP_PASSWORD;
+  if (configuredAppSecret()) headers['x-app-password'] = configuredAppSecret();
   const response = await fetch(`http://127.0.0.1:${PORT}${endpoint}`, {
     method: 'POST', headers, body: JSON.stringify(payload || {}), signal: AbortSignal.timeout(120_000),
   });
@@ -849,6 +1057,34 @@ app.post('/api/settings/github-token', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.post('/api/settings/openrouter-keys', async (req, res, next) => {
+  try {
+    const key1 = String(req.body?.key1 || '').trim();
+    const key2 = String(req.body?.key2 || '').trim();
+    const renderToken = req.body?.renderToken || process.env.RENDER_API_TOKEN;
+    const serviceId = process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || '';
+    if (!renderToken || !serviceId) throw httpError('A fresh Render API key and StackPilot service ID are required to save model keys to Render.');
+    if (!key1 || key1.length < 20 || (key2 && key2.length < 20)) throw httpError('Enter one or two valid-looking OpenRouter keys.');
+    const values = [['OPENROUTER_API_KEY_1', key1], ['OPENROUTER_API_KEY_2', key2], ['OPENROUTER_MODEL', 'openrouter/free']];
+    await Promise.all(values.map(([key, value]) => renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/env-vars/${encodeURIComponent(key)}`, { method: 'PUT', body: JSON.stringify({ value }) })));
+    const deploy = await renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/deploys`, { method: 'POST', body: JSON.stringify({ clearCache: 'do_not_clear' }) });
+    res.json({ ok: true, deployId: deploy.id || '', message: 'OpenRouter keys were saved as Render environment secrets. Free model routing will activate after the queued deploy.' });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/settings/app-pin', async (req, res, next) => {
+  try {
+    const pin = String(req.body?.pin || '').trim();
+    const renderToken = req.body?.renderToken || process.env.RENDER_API_TOKEN;
+    const serviceId = process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || '';
+    if (!/^\d{4}$/.test(pin)) throw httpError('The App PIN must be exactly four digits.');
+    if (!renderToken || !serviceId) throw httpError('A fresh Render API key and StackPilot service ID are required to update the Render environment.');
+    await renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/env-vars/APP_PIN`, { method: 'PUT', body: JSON.stringify({ value: pin }) });
+    const deploy = await renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/deploys`, { method: 'POST', body: JSON.stringify({ clearCache: 'do_not_clear' }) });
+    res.json({ ok: true, deployId: deploy.id || '', message: 'The four-digit PIN is in Render environment. It becomes active when the queued deploy starts.' });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/jobs', async (req, res, next) => {
   try {
     const input = req.body || {};
@@ -859,15 +1095,19 @@ app.post('/api/jobs', async (req, res, next) => {
     if ([...backgroundJobs.values()].some((job) => ['queued', 'running'].includes(job.status))) throw httpError('Another StackPilot background run is already active. Wait for it to finish first.', 409);
     if (!String(project.repo || '').trim()) throw httpError('Enter the GitHub repository (owner/repo) first.');
     const credentials = {
-      anthropicKey: String(input.credentials?.anthropicKey || process.env.ANTHROPIC_API_KEY || ''),
+      openRouterKeys: normalizeOpenRouterKeys([
+        input.credentials?.openRouterKey1, input.credentials?.openRouterKey2,
+        process.env.OPENROUTER_API_KEY_1, process.env.OPENROUTER_API_KEY_2, process.env.OPENROUTER_API_KEY,
+      ]),
       githubToken: String(input.credentials?.githubToken || process.env.GITHUB_TOKEN || ''),
       renderToken: String(input.credentials?.renderToken || process.env.RENDER_API_TOKEN || ''),
     };
     if (!credentials.githubToken) throw httpError('Add a GitHub token in Settings or configure GITHUB_TOKEN on the server.');
     const rawInput = typeof project.rawInput === 'string' ? project.rawInput : '';
     const sourceFiles = project.files && typeof project.files === 'object' ? project.files : {};
-    if (!rawInput.trim() && !Object.keys(sourceFiles).length) throw httpError('Paste a code dump or add project files before starting.');
-    if (rawInput.length > 100_000) throw httpError('That code dump is over the 100,000 character limit.');
+    if (!rawInput.trim() && !Object.keys(sourceFiles).length) throw httpError('Paste a code dump, import a ZIP, or add project files before starting.');
+    if (rawInput.trim() && !credentials.openRouterKeys.length) throw httpError('Add one or two OpenRouter keys in Settings to organize a pasted brief or code dump.');
+    if (rawInput.length > 40_000) throw httpError('Keep the brief or code dump under 40,000 characters for the free-model context budget.');
     const jobId = randomUUID();
     const job = {
       id: jobId, projectId, name, status: 'queued', activeAgent: 'StackPilot orchestrator',
@@ -890,7 +1130,7 @@ app.post('/api/jobs', async (req, res, next) => {
         summary: String(project.summary || ''), stack: String(project.stack || ''), autoDeploy: Boolean(project.autoDeploy),
         envVars: Array.isArray(input.envVars) ? input.envVars : [],
       },
-      ownerId: String(input.renderOwnerId || process.env.RENDER_OWNER_ID || ''), model: String(input.model || 'claude-sonnet-5-5'),
+      ownerId: String(input.renderOwnerId || process.env.RENDER_OWNER_ID || ''), model: normalizeFreeModel(input.model || process.env.OPENROUTER_MODEL),
     };
     runBackgroundJob(job, context).catch((error) => console.error('[job] unhandled failure', error.message));
     res.status(202).json({ jobId, status: job.status, projectId, message: 'Background run started.' });
@@ -914,10 +1154,10 @@ async function runBackgroundJob(job, ctx) {
     job.status = 'running';
     jobStep(job, 'organize', p.rawInput.trim() ? 'running' : 'done', 'Project architect', p.rawInput.trim() ? 'Reading the dump and assembling a runnable project structure.' : 'Starting from the saved project files.');
     if (p.rawInput.trim()) {
-      const organized = await internalPost('/api/organize', { input: p.rawInput, projectName: p.name, apiKey: creds.anthropicKey, model: ctx.model });
-      files = organized.files || {};
-      Object.assign(p, organized);
-      appendJobLog(job, `Project architect organized ${Object.keys(files).length} files · ${organized.stack || 'stack identified'}.`, 'success', 'Claude architect');
+      const organized = await internalPost('/api/organize', { input: p.rawInput, files, projectName: p.name, apiKeys: creds.openRouterKeys, model: ctx.model });
+      files = { ...files, ...(organized.files || {}) };
+      Object.assign(p, organized, { files });
+      appendJobLog(job, `Free-model architect reviewed the project · ${organized.stack || 'stack identified'}.`, 'success', 'OpenRouter architect');
       (organized.notes || []).forEach((note) => appendJobLog(job, note, 'warning', 'Project architect'));
       patchJob(job, { files, activeFile: Object.keys(files).sort()[0] || '', summary: organized.summary || '', stack: organized.stack || '', serviceType: organized.deployType || p.serviceType, runtime: organized.runtime || p.runtime, buildCommand: organized.buildCommand || p.buildCommand, startCommand: organized.startCommand || p.startCommand, publishPath: organized.publishPath || p.publishPath, rawInput: p.rawInput });
     } else appendJobLog(job, 'Using the current project file tree.', 'info', 'Project architect');
@@ -929,12 +1169,18 @@ async function runBackgroundJob(job, ctx) {
       appendJobLog(job, `Preflight inspected ${preflight.files} files · ${preflight.findings.length} finding(s).`, preflight.ok ? 'success' : 'warning', 'Safety & build guard');
       preflight.findings.forEach((finding) => appendJobLog(job, finding.message, finding.severity === 'error' ? 'error' : 'warning', 'Preflight'));
       if (preflight.ok) { job.steps.preflight = 'done'; break; }
-      if (!creds.anthropicKey || repairs >= 2) throw new Error('Preflight found blocking issues. Add Claude in Settings or fix the files before retrying.');
-      const repair = await internalPost('/api/repair', { files, errors: preflight.findings.map((finding) => finding.message).join('\n'), apiKey: creds.anthropicKey, model: ctx.model });
+      if (!creds.openRouterKeys.length || repairs >= 2) throw new Error('Preflight found blocking issues. Add an OpenRouter key in Settings or fix the files before retrying.');
+      const repair = await internalPost('/api/repair', { files, errors: preflight.findings.map((finding) => finding.message).join('\n'), apiKeys: creds.openRouterKeys, model: ctx.model });
       files = { ...files, ...(repair.files || {}) };
       repairs += 1;
       appendJobLog(job, `${repair.summary || 'Applied a targeted preflight repair.'} (repair ${repairs}/2).`, 'warning', 'Repair agent');
       patchJob(job, { files, activeFile: Object.keys(repair.files || {})[0] || Object.keys(files)[0] || '' });
+    }
+
+    if (p.renderServiceId) {
+      if (!creds.renderToken) throw new Error('An existing Render service may auto-deploy directly from a GitHub push. Add a Render API key so StackPilot can disable that trigger before pushing, or remove the existing service ID.');
+      await internalPost('/api/render/disable-autodeploy', { token: creds.renderToken, serviceId: p.renderServiceId });
+      appendJobLog(job, 'Disabled the existing Render service auto-deploy trigger. StackPilot will only queue a deploy after GitHub checks pass.', 'success', 'Render release gate');
     }
 
     while (true) {
@@ -973,10 +1219,10 @@ async function runBackgroundJob(job, ctx) {
         break;
       }
       job.steps.runner = 'error';
-      if (!creds.anthropicKey || !runInfo.logs || repairs >= 2) throw new Error(runInfo.logs ? 'Remote build failed after the allowed repair attempts.' : 'Remote build failed; add Claude and verify GitHub Actions log access to enable auto-repair.');
+      if (!creds.openRouterKeys.length || !runInfo.logs || repairs >= 2) throw new Error(runInfo.logs ? 'Remote build failed after the allowed repair attempts.' : 'Remote build failed; verify GitHub Actions log access before asking the free model to repair it.');
       repairs += 1;
-      appendJobLog(job, `The build failed. Repair agent is reviewing its real runner logs (${repairs}/2)…`, 'warning', 'Repair agent');
-      const repair = await internalPost('/api/repair', { files, errors: runInfo.logs, apiKey: creds.anthropicKey, model: ctx.model });
+      appendJobLog(job, `The build failed. OpenRouter repair is reviewing its real runner logs (${repairs}/2)…`, 'warning', 'Repair agent');
+      const repair = await internalPost('/api/repair', { files, errors: runInfo.logs, apiKeys: creds.openRouterKeys, model: ctx.model });
       files = { ...files, ...(repair.files || {}) };
       appendJobLog(job, repair.summary || 'Applied a build-log-guided repair.', 'warning', 'Repair agent');
       patchJob(job, { files, activeFile: Object.keys(repair.files || {})[0] || Object.keys(files)[0] || '' });
@@ -989,7 +1235,7 @@ async function runBackgroundJob(job, ctx) {
       appendJobLog(job, 'Automatic Render step is off. Everything is pushed and tested; use Deploy when you are ready.', 'success', 'Release gate');
       return;
     }
-    if (!creds.renderToken || !ctx.ownerId) {
+    if (!creds.renderToken || (!p.renderServiceId && !ctx.ownerId)) {
       job.status = 'verified';
       patchJob(job, { status: 'verified', files, repo: p.repo, branch: p.branch, lastCommit: p.lastCommit, lastCommitUrl: p.lastCommitUrl });
       appendJobLog(job, 'GitHub checks passed. Add a Render API key and workspace ID to start the deployment.', 'warning', 'Render operator');
@@ -1044,10 +1290,10 @@ async function runBackgroundJob(job, ctx) {
       if (['build_failed', 'update_failed', 'pre_deploy_failed', 'canceled', 'deactivated'].includes(status.status)) { renderOutcome = { ok: false, logs: job.logs.slice(-120).map((line) => line.text).join('\n') }; break; }
       await sleep(7000);
     }
-    while (!renderOutcome.ok && repairs < 2 && creds.anthropicKey && renderOutcome.logs) {
+    while (!renderOutcome.ok && repairs < 2 && creds.openRouterKeys.length && renderOutcome.logs) {
       repairs += 1;
-      appendJobLog(job, `Render failed. Repair agent is reviewing the deployment log (${repairs}/2)…`, 'warning', 'Repair agent');
-      const repair = await internalPost('/api/repair', { files, errors: renderOutcome.logs.slice(-45_000), apiKey: creds.anthropicKey, model: ctx.model });
+      appendJobLog(job, `Render failed. OpenRouter repair is reviewing the deployment log (${repairs}/2)…`, 'warning', 'Repair agent');
+      const repair = await internalPost('/api/repair', { files, errors: renderOutcome.logs.slice(-20_000), apiKeys: creds.openRouterKeys, model: ctx.model });
       files = { ...files, ...(repair.files || {}) };
       patchJob(job, { files, activeFile: Object.keys(repair.files || {})[0] || Object.keys(files)[0] || '' });
       appendJobLog(job, repair.summary || 'Applied a Render-log-guided repair.', 'warning', 'Repair agent');
@@ -1086,7 +1332,7 @@ async function runBackgroundJob(job, ctx) {
   } finally {
     job.completedAt = new Date().toISOString();
     job.updatedAt = new Date().toISOString();
-    ctx.credentials.anthropicKey = '';
+    ctx.credentials.openRouterKeys = [];
     ctx.credentials.githubToken = '';
     ctx.credentials.renderToken = '';
     ctx.project.rawInput = '';
