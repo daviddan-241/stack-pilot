@@ -698,8 +698,9 @@ app.post('/api/render/logs', async (req, res, next) => {
     const ownerId = req.body?.ownerId || process.env.RENDER_OWNER_ID;
     const token = req.body?.token || process.env.RENDER_API_TOKEN;
     if (!token || !ownerId || !serviceId) throw httpError('Render token, workspace ID, and service ID are required to load logs.');
-    const start = since ? Math.floor(Date.parse(since) / 1000) : Math.floor(Date.now() / 1000) - 45 * 60;
-    const params = new URLSearchParams({ ownerId, startTime: String(Number.isFinite(start) ? start : Math.floor(Date.now() / 1000) - 2700), direction: 'forward', limit: '100' });
+    const start = since ? Date.parse(since) : Date.now() - 45 * 60 * 1000;
+    const startTime = new Date(Number.isFinite(start) ? start : Date.now() - 45 * 60 * 1000).toISOString();
+    const params = new URLSearchParams({ ownerId, startTime, direction: 'forward', limit: '100' });
     params.append('resource', serviceId);
     params.append('type', 'build');
     params.append('type', 'app');
