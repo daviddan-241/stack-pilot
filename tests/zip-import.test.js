@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import JSZip from 'jszip';
-import { extractProjectZip } from '../src/zipImport.js';
+import { extractProjectZip, extractProjectZips } from '../src/zipImport.js';
 import { binaryAssetByteLength, isBinaryAsset, parseBinaryAsset } from '../src/projectFiles.js';
 
 function namedFile(name, text, size = new Date()) { return new File([text], name, { lastModified: size instanceof Date ? size.getTime() : size }); }
@@ -42,4 +42,31 @@ test('rejects an OpenRouter-style live key in a source file', async () => {
   archive.file('main.js', `const key = "${liveKey}";`);
   const blob = await archive.generateAsync({ type: 'nodebuffer' });
   await assert.rejects(() => extractProjectZip(namedFile('project.zip', blob)), /possible live credential/i);
+});
+
+test('merges multiple ZIP archives within one bounded project import', async () => {
+  const first = new JSZip();
+  first.file('src/main.js', 'export const main = true;');
+  first.file('README.md', '# Demo');
+  const second = new JSZip();
+  second.file('styles-export/src/styles.css', 'body { color: #333; }');
+  const [firstBlob, secondBlob] = await Promise.all([
+    first.generateAsync({ type: 'nodebuffer' }), second.generateAsync({ type: 'nodebuffer' }),
+  ]);
+  const result = await extractProjectZips([
+    namedFile('source.zip', firstBlob), namedFile('styles.zip', secondBlob),
+  ]);
+  assert.equal(result.archiveCount, 2);
+  assert.equal(result.count, 3);
+  assert.equal(result.files['src/main.js'], 'export const main = true;');
+  assert.equal(result.files['src/styles.css'], 'body { color: #333; }');
+});
+
+test('bounds multi-ZIP selection to 100 archives and 25 MB compressed', async () => {
+  const emptyArchive = namedFile('empty.zip', new Uint8Array());
+  await assert.rejects(() => extractProjectZips(Array.from({ length: 101 }, () => emptyArchive)), /no more than 100/i);
+  await assert.rejects(() => extractProjectZips([
+    { name: 'large-a.zip', size: 13 * 1024 * 1024 },
+    { name: 'large-b.zip', size: 13 * 1024 * 1024 },
+  ]), /25 MB combined/i);
 });

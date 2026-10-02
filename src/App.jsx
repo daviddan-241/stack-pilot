@@ -9,21 +9,15 @@ import {
 } from 'lucide-react';
 import { createProjectId, getProjects, removeProject, saveProject } from './storage.js';
 import { STEPS, calculateProgress, detectEnvKeys } from './workflow.js';
-import { extractProjectZip } from './zipImport.js';
+import { extractProjectZips } from './zipImport.js';
 import { normalizeMonitorUrl } from './monitor.js';
 import { binaryAssetByteLength, binaryAssetDataUri, isBinaryAsset, parseBinaryAsset } from './projectFiles.js';
 
-const SECRET_KEYS = {
-  openRouterKey1: 'stackpilot.openrouter.1.session',
-  openRouterKey2: 'stackpilot.openrouter.2.session',
-  githubToken: 'stackpilot.github.session',
-  renderToken: 'stackpilot.render.session',
-  appPassword: 'stackpilot.password.session',
-  renderOwnerId: 'stackpilot.render.owner',
-  githubTokenExpiresAt: 'stackpilot.github.expires',
-};
-const PROJECT_VAULT_PREFIX = 'stackpilot.project.vault.';
-const PROJECT_ENV_PREFIX = 'stackpilot.project.env.';
+const SECRET_KEYS = { githubTokenExpiresAt: 'stackpilot.github.expires' };
+const LEGACY_SESSION_SECRET_KEYS = [
+  'stackpilot.openrouter.1.session', 'stackpilot.openrouter.2.session', 'stackpilot.github.session',
+  'stackpilot.render.session', 'stackpilot.password.session', 'stackpilot.render.owner',
+];
 
 const SAMPLE_DUMP = `Please build a clean one-page product site for Northstar. Use mobile-first HTML, CSS, and JavaScript. Include a responsive hero, one call to action, and a short features section. Keep the visual style calm, premium, and accessible.\n\nindex.html:\n<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Northstar</title><link rel="stylesheet" href="styles.css"></head><body><main><nav>Northstar</nav><h1>Make room for good work.</h1><p>A calmer way to plan.</p><a href="#features">Find your focus</a></main></body></html>\n\nstyles.css:\nbody { margin: 0; background: #f8f7f4; color: #25251f; font-family: sans-serif; }\nmain { max-width: 900px; margin: auto; padding: 48px; }\nh1 { font-family: Georgia, serif; font-size: 5rem; }\n/* TODO: add accessible mobile styles and the features section */`;
 
@@ -41,9 +35,15 @@ function newProject(name = 'Untitled project') {
     updatedAt: new Date().toISOString(), autoDeploy: true, jobId: '', progress: 0, activeAgent: '',
   };
 }
-function readSession(key) { try { return sessionStorage.getItem(key) || ''; } catch { return ''; } }
-function writeSession(key, value) { try { sessionStorage.setItem(key, value || ''); } catch { /* private mode */ } }
-function readJsonSession(key, fallback) { try { return JSON.parse(sessionStorage.getItem(key) || '') || fallback; } catch { return fallback; } }
+function clearLegacySessionSecrets() {
+  try {
+    LEGACY_SESSION_SECRET_KEYS.forEach((key) => sessionStorage.removeItem(key));
+    for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+      const key = sessionStorage.key(index) || '';
+      if (key.startsWith('stackpilot.project.vault.') || key.startsWith('stackpilot.project.env.')) sessionStorage.removeItem(key);
+    }
+  } catch { /* storage may be disabled */ }
+}
 function timeLabel(value) {
   try { return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(value)); }
   catch { return '--:--:--'; }
@@ -70,17 +70,12 @@ function fileIconFor(path) {
   if (path.endsWith('.md')) return BookOpen;
   return File;
 }
-function parseVault(projectId) { return readJsonSession(`${PROJECT_VAULT_PREFIX}${projectId}`, {}); }
-function parseProjectEnv(projectId) { return readJsonSession(`${PROJECT_ENV_PREFIX}${projectId}`, []); }
 function readMonitors() {
   try {
     const saved = JSON.parse(localStorage.getItem('stackpilot.uptime.monitors') || 'null');
     if (Array.isArray(saved)) return saved.slice(0, 30);
   } catch { /* local storage may be disabled */ }
   return [{ id: 'stackpilot-main', name: 'StackPilot', url: `${typeof window !== 'undefined' ? window.location.origin : 'https://stack-pilot-builder.onrender.com'}/health`, intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' }];
-}
-function saveProjectEnvSession(projectId, rows) {
-  try { sessionStorage.setItem(`${PROJECT_ENV_PREFIX}${projectId}`, JSON.stringify(rows)); } catch { /* session-only by design */ }
 }
 function base64UrlToBytes(value) {
   const padded = `${value}${'='.repeat((4 - value.length % 4) % 4)}`;
@@ -92,12 +87,15 @@ function App() {
   const [projects, setProjects] = useState([]);
   const [activeId, setActiveId] = useState('');
   const [loading, setLoading] = useState(true);
-  const [connectors, setConnectors] = useState(() => ({
-    openRouterKey1: readSession(SECRET_KEYS.openRouterKey1), openRouterKey2: readSession(SECRET_KEYS.openRouterKey2),
-    githubToken: readSession(SECRET_KEYS.githubToken), renderToken: readSession(SECRET_KEYS.renderToken),
-    appPassword: readSession(SECRET_KEYS.appPassword), renderOwnerId: readSession(SECRET_KEYS.renderOwnerId),
-  }));
+  const [connectors, setConnectors] = useState({ openRouterKey1: '', openRouterKey2: '', githubToken: '', renderToken: '', appPassword: '', renderOwnerId: '' });
+  const [projectVaults, setProjectVaults] = useState({});
+  const [projectEnvRows, setProjectEnvRows] = useState({});
+  const [projectCredentialStatus, setProjectCredentialStatus] = useState({});
   const [health, setHealth] = useState({ authRequired: false, appPinRequired: false, envConfigured: {} });
+  const [accessGranted, setAccessGranted] = useState(false);
+  const [unlockInput, setUnlockInput] = useState('');
+  const [unlockBusy, setUnlockBusy] = useState(false);
+  const [unlockError, setUnlockError] = useState('');
   const [page, setPage] = useState('start');
   const [workspaceTab, setWorkspaceTab] = useState('build');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -126,8 +124,6 @@ function App() {
   const [editorDraft, setEditorDraft] = useState('');
   const [editorDirty, setEditorDirty] = useState(false);
   const [search, setSearch] = useState('');
-  const [vaultVersion, setVaultVersion] = useState(0);
-  const [envVersion, setEnvVersion] = useState(0);
   const [tokenExpiry, setTokenExpiry] = useState(() => {
     try { return localStorage.getItem(SECRET_KEYS.githubTokenExpiresAt) || ''; } catch { return ''; }
   });
@@ -139,15 +135,15 @@ function App() {
   const activePolls = useRef(new Set());
   const savedVersions = useRef(new Map());
   const active = projects.find((project) => project.id === activeId) || null;
-  const activeVault = useMemo(() => activeId ? parseVault(activeId) : {}, [activeId, vaultVersion]);
+  const activeVault = useMemo(() => activeId ? (projectVaults[activeId] || {}) : {}, [activeId, projectVaults]);
   const detectedEnv = useMemo(() => active ? detectEnvKeys(active.files || {}) : [], [active?.files]);
   const projectEnv = useMemo(() => {
     if (!activeId) return [];
-    const saved = parseProjectEnv(activeId);
+    const saved = projectEnvRows[activeId] || [];
     const values = new Map(saved.map((item) => [item.key, item]));
     detectedEnv.forEach((item) => { if (!values.has(item.key)) values.set(item.key, item); });
     return [...values.values()].slice(0, 30);
-  }, [activeId, envVersion, detectedEnv]);
+  }, [activeId, projectEnvRows, detectedEnv]);
   const activeJobs = useMemo(() => projects.filter((project) => project.jobId && ['queued', 'running', 'deploying'].includes(project.status)), [projects]);
   const activeJobSignature = activeJobs.map((project) => `${project.id}:${project.jobId}`).join('|');
   const appBusy = activeJobs.length > 0;
@@ -159,7 +155,13 @@ function App() {
     const response = await fetch(url, { method, headers, ...(method === 'GET' ? {} : { body: JSON.stringify(payload || {}) }) });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      if (response.status === 401 && health.authRequired) throw new Error('Workspace password is missing or incorrect. Open Settings to unlock it.');
+      if (response.status === 401 && health.authRequired) {
+        setAccessGranted(false);
+        setConnectors((current) => ({ ...current, appPassword: '' }));
+        setUnlockInput('');
+        setUnlockError('Your app passcode needs to be entered again.');
+        throw new Error('The workspace passcode was rejected. Return to the lock screen and try again.');
+      }
       throw new Error(data.error || `Request failed (${response.status}).`);
     }
     return data;
@@ -170,6 +172,24 @@ function App() {
     setToastList((items) => [...items, { id, message, tone }]);
     window.setTimeout(() => setToastList((items) => items.filter((item) => item.id !== id)), 4500);
   }, []);
+
+  const submitUnlock = async (event) => {
+    event.preventDefault();
+    if (!unlockInput.trim()) { setUnlockError('Enter your app passcode to continue.'); return; }
+    if (health.appPinRequired && !/^\d{4}$/.test(unlockInput)) { setUnlockError('Enter the four-digit app PIN.'); return; }
+    setUnlockBusy(true);
+    setUnlockError('');
+    try {
+      const response = await fetch('/api/auth/check', { method: 'POST', headers: { 'content-type': 'application/json', 'x-app-password': unlockInput } });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || (response.status === 429 ? 'Too many attempts. Wait ten minutes and try again.' : 'That passcode did not match. Try again.'));
+      setConnectors((current) => ({ ...current, appPassword: unlockInput }));
+      setAccessGranted(true);
+      setUnlockError('');
+    } catch (error) {
+      setUnlockError(error.message || 'Could not unlock the workspace.');
+    } finally { setUnlockBusy(false); }
+  };
 
   const updateProject = useCallback((id, patch) => {
     setProjects((current) => current.map((project) => {
@@ -184,11 +204,12 @@ function App() {
   }, [updateProject]);
 
   const updateProjectFiles = useCallback((id, files) => {
-    const existing = parseProjectEnv(id);
-    const envMap = new Map(existing.map((row) => [row.key, row]));
-    detectEnvKeys(files).forEach((row) => { if (!envMap.has(row.key)) envMap.set(row.key, row); });
-    saveProjectEnvSession(id, [...envMap.values()].slice(0, 30));
-    setEnvVersion((value) => value + 1);
+    const detected = detectEnvKeys(files);
+    setProjectEnvRows((current) => {
+      const envMap = new Map((current[id] || []).map((row) => [row.key, row]));
+      detected.forEach((row) => { if (!envMap.has(row.key)) envMap.set(row.key, row); });
+      return { ...current, [id]: [...envMap.values()].slice(0, 30) };
+    });
   }, []);
 
   const pingMonitor = useCallback(async (id) => {
@@ -288,6 +309,7 @@ function App() {
   }, [projects]);
 
   useEffect(() => {
+    clearLegacySessionSecrets();
     let mounted = true;
     (async () => {
       try {
@@ -305,11 +327,30 @@ function App() {
           try { localStorage.setItem(SECRET_KEYS.githubTokenExpiresAt, serverHealth.githubTokenExpiresAt); } catch { /* storage disabled */ }
         }
         rows.forEach((project) => savedVersions.current.set(project.id, project.updatedAt));
-        if (serverHealth?.authRequired && !readSession(SECRET_KEYS.appPassword)) setSettingsOpen(true);
       } finally { if (mounted) setLoading(false); }
     })();
     return () => { mounted = false; };
   }, []);
+
+  useEffect(() => {
+    if (loading) return undefined;
+    if (!health.authRequired) { setAccessGranted(true); return undefined; }
+    setAccessGranted(false);
+    const savedCode = connectors.appPassword;
+    if (!savedCode) return undefined;
+    let cancelled = false;
+    fetch('/api/auth/check', { method: 'POST', headers: { 'content-type': 'application/json', 'x-app-password': savedCode } })
+      .then((response) => {
+        if (cancelled) return;
+        if (response.ok) setAccessGranted(true);
+        else {
+          setConnectors((current) => ({ ...current, appPassword: '' }));
+          setUnlockInput('');
+        }
+      })
+      .catch(() => { if (!cancelled) setAccessGranted(false); });
+    return () => { cancelled = true; };
+  }, [loading, health.authRequired]);
 
   useEffect(() => {
     if (!active?.activeFile) { setEditorDraft(''); setEditorDirty(false); return; }
@@ -332,17 +373,6 @@ function App() {
       saveTimers.current.set(project.id, timer);
     });
   }, [projects, loading]);
-
-  useEffect(() => {
-    try {
-      writeSession(SECRET_KEYS.openRouterKey1, connectors.openRouterKey1);
-      writeSession(SECRET_KEYS.openRouterKey2, connectors.openRouterKey2);
-      writeSession(SECRET_KEYS.githubToken, connectors.githubToken);
-      writeSession(SECRET_KEYS.renderToken, connectors.renderToken);
-      writeSession(SECRET_KEYS.appPassword, connectors.appPassword);
-      writeSession(SECRET_KEYS.renderOwnerId, connectors.renderOwnerId);
-    } catch { /* private mode */ }
-  }, [connectors]);
 
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }); }, [active?.logs?.length]);
 
@@ -426,23 +456,39 @@ function App() {
 
   const setVaultField = (projectId, field, value) => {
     if (!projectId) return;
-    const next = { ...parseVault(projectId), [field]: value };
-    try { sessionStorage.setItem(`${PROJECT_VAULT_PREFIX}${projectId}`, JSON.stringify(next)); } catch { /* session-only by design */ }
-    setVaultVersion((current) => current + 1);
+    setProjectVaults((current) => ({ ...current, [projectId]: { ...(current[projectId] || {}), [field]: value } }));
   };
   const setEnvironmentRows = (projectId, rows) => {
     if (!projectId) return;
-    saveProjectEnvSession(projectId, rows.slice(0, 30));
-    setEnvVersion((current) => current + 1);
+    setProjectEnvRows((current) => ({ ...current, [projectId]: rows.slice(0, 30) }));
   };
   const effectiveCredentials = (projectId) => {
-    const vault = projectId ? parseVault(projectId) : {};
+    const vault = projectId ? projectVaults[projectId] || {} : {};
     return {
       openRouterKey1: vault.openRouterKey1 || connectors.openRouterKey1 || '',
       openRouterKey2: vault.openRouterKey2 || connectors.openRouterKey2 || '',
       githubToken: vault.githubToken || connectors.githubToken || '',
       renderToken: vault.renderToken || connectors.renderToken || '',
+      renderOwnerId: vault.renderOwnerId || connectors.renderOwnerId || '',
     };
+  };
+  const loadProjectCredentialStatus = async (projectId) => {
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/credentials`, undefined, 'GET');
+    setProjectCredentialStatus((current) => ({ ...current, [projectId]: result.configured || {} }));
+    return result.configured || {};
+  };
+  const saveProjectCredentials = async (projectId, credentials) => {
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/credentials`, { credentials, adminRenderToken: connectors.renderToken || '' });
+    setProjectCredentialStatus((current) => ({ ...current, [projectId]: result.configured || {} }));
+    showToast('Project keys were saved as secrets on StackPilot Render. A restart has been queued.', 'success');
+    return result;
+  };
+  const clearProjectCredentials = async (projectId) => {
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}/credentials`, { clear: true, adminRenderToken: connectors.renderToken || '' });
+    setProjectCredentialStatus((current) => ({ ...current, [projectId]: result.configured || {} }));
+    setProjectVaults((current) => { const next = { ...current }; delete next[projectId]; return next; });
+    showToast('Saved project platform keys were cleared from StackPilot Render.', 'success');
+    return result;
   };
 
   const testGithub = async () => {
@@ -498,7 +544,8 @@ function App() {
     setTokenExpiry(expiry || '');
     try { localStorage.setItem(SECRET_KEYS.githubTokenExpiresAt, expiry || ''); } catch { /* storage disabled */ }
     setHealth((current) => ({ ...current, envConfigured: { ...(current.envConfigured || {}), github: true }, githubTokenExpiresAt: expiry || '', serviceId: current.serviceId || '' }));
-    showToast('Fresh GitHub token saved as a Render secret. StackPilot is restarting to activate it.', 'success');
+    setConnectors((current) => ({ ...current, githubToken: '' }));
+    showToast('Fresh GitHub token saved as a Render secret. The browser field was cleared; StackPilot is restarting to activate it.', 'success');
     return result;
   };
 
@@ -560,15 +607,16 @@ function App() {
     if (project.repo) window.setTimeout(() => runFullPipeline(project), 50);
   };
 
-  const importZipFile = async (file) => {
-    if (!file) return;
+  const importZipFile = async (fileList) => {
+    const archives = Array.from(fileList || []);
+    if (!archives.length) return;
     setZipBusy(true);
     try {
-      const result = await extractProjectZip(file);
+      const result = await extractProjectZips(archives);
       setStartFiles(result.files);
-      setZipFilename(file.name);
-      showToast(`Imported ${result.count} text files${result.skipped ? ` · skipped ${result.skipped} generated/binary entries` : ''}.`, 'success');
-    } catch (error) { setStartFiles({}); setZipFilename(''); showToast(error.message || 'Could not read that ZIP archive.', 'error'); }
+      setZipFilename(archives.length === 1 ? archives[0].name : `${archives.length} ZIP archives`);
+      showToast(`Imported ${result.count} project files from ${archives.length} archive${archives.length === 1 ? '' : 's'}${result.skipped ? ` · skipped ${result.skipped} generated/binary entries` : ''}.`, 'success');
+    } catch (error) { showToast(error.message || 'Could not read those ZIP archives.', 'error'); }
     finally { setZipBusy(false); }
   };
 
@@ -605,7 +653,7 @@ function App() {
     setActiveId(''); setPage('start');
   };
 
-  const openProject = (id) => { setActiveId(id); setPage('workspace'); setWorkspaceTab('build'); };
+  const openProject = (id) => { setActiveId(id); setPage('workspace'); setWorkspaceTab('build'); loadProjectCredentialStatus(id).catch(() => {}); };
 
   const deleteProject = async (id) => {
     const project = projects.find((row) => row.id === id);
@@ -615,7 +663,9 @@ function App() {
     if (timer) window.clearTimeout(timer);
     saveTimers.current.delete(id);
     await removeProject(id).catch(() => {});
-    try { sessionStorage.removeItem(`${PROJECT_VAULT_PREFIX}${id}`); sessionStorage.removeItem(`${PROJECT_ENV_PREFIX}${id}`); } catch { /* ignore */ }
+    setProjectVaults((current) => { const next = { ...current }; delete next[id]; return next; });
+    setProjectEnvRows((current) => { const next = { ...current }; delete next[id]; return next; });
+    setProjectCredentialStatus((current) => { const next = { ...current }; delete next[id]; return next; });
     const next = projects.filter((row) => row.id !== id);
     setProjects(next);
     setMonitors((rows) => rows.filter((item) => item.projectId !== id && item.id !== `project_${id}`));
@@ -627,13 +677,10 @@ function App() {
     const project = projectOverride || active;
     if (!project || appBusy) return;
     const credentials = effectiveCredentials(project.id);
-    if (!credentials.githubToken && !health.envConfigured?.github) { setSettingsOpen(true); showToast('Add a GitHub token in Settings or save one in the server environment.', 'error'); return; }
-    const needsOpenRouter = Boolean(project.rawInput?.trim());
-    if (needsOpenRouter && !credentials.openRouterKey1 && !credentials.openRouterKey2 && !health.envConfigured?.openrouter) { setSettingsOpen(true); showToast('Add an OpenRouter key to organize a pasted brief or code dump.', 'error'); return; }
     const runProject = { ...project };
     if (project.status === 'verified' && Object.keys(project.files || {}).length) runProject.rawInput = '';
-    const envVars = (project.id === activeId ? projectEnv : parseProjectEnv(project.id)).filter((row) => row.key && row.value !== undefined).map(({ key, value }) => ({ key, value: String(value) }));
-    updateProject(project.id, { status: 'running', progress: 1, activeAgent: 'StackPilot orchestrator', jobId: '', steps: Object.fromEntries(STEPS.map((step) => [step.id, 'idle'])) });
+    const envVars = (project.id === activeId ? projectEnv : projectEnvRows[project.id] || []).filter((row) => row.key && row.value !== undefined).map(({ key, value }) => ({ key, value: String(value) }));
+    updateProject(project.id, { status: 'running', progress: 0, activeAgent: 'StackPilot orchestrator', jobId: '', steps: Object.fromEntries(STEPS.map((step) => [step.id, 'idle'])) });
     appendLog(project.id, 'Background run requested. StackPilot keeps working server-side if you leave the page.', 'info', 'Orchestrator');
     try {
       const started = await api('/api/jobs', {
@@ -643,12 +690,13 @@ function App() {
         envVars,
         model: 'openrouter/free',
       });
-      updateProject(project.id, { jobId: started.jobId, status: 'running', progress: 1, activeAgent: 'StackPilot orchestrator' });
+      updateProject(project.id, { jobId: started.jobId, status: 'running', progress: 0, activeAgent: 'StackPilot orchestrator' });
       pollCursor.current.set(started.jobId, { after: 0, version: 0 });
       showToast('StackPilot agents are working in the background.', 'success');
     } catch (error) {
       updateProject(project.id, { status: 'needs_attention', progress: 0, jobId: '' });
       appendLog(project.id, error.message || 'Could not start the background run.', 'error', 'StackPilot');
+      if (/key override|key in project settings/i.test(error.message || '')) { setActiveId(project.id); setPage('workspace'); setWorkspaceTab('deploy'); }
       showToast(error.message || 'Could not start the background run.', 'error');
     }
   };
@@ -670,17 +718,16 @@ function App() {
     if (!active || appBusy || shellBusy) return;
     if (!active.repo) { showToast('Add the repository in Release settings first.', 'error'); return; }
     const credentials = effectiveCredentials(active.id);
-    if (!credentials.githubToken && !health.envConfigured?.github) { setSettingsOpen(true); showToast('Connect GitHub before running a temporary command.', 'error'); return; }
     if (!shellCommand.trim()) { showToast('Enter a command for the temporary runner.', 'error'); return; }
     setShellBusy(true);
     const captureAt = Date.now();
     appendLog(active.id, `Queueing temporary GitHub runner command: ${shellCommand}`, 'info', 'Remote shell');
     try {
-      await api('/api/github/dispatch', { token: credentials.githubToken, repository: active.repo, branch: active.branch || 'main', command: shellCommand });
+      await api('/api/github/dispatch', { token: credentials.githubToken, projectId: active.id, repository: active.repo, branch: active.branch || 'main', command: shellCommand });
       appendLog(active.id, 'Command accepted by a temporary GitHub Actions runner. The command continues if you close this page.', 'info', 'Remote shell');
       let waited = 0; let last = '';
       while (waited < 7 * 60_000) {
-        const info = await api('/api/github/runs', { token: credentials.githubToken, repository: active.repo, branch: active.branch || 'main', since: new Date(captureAt).toISOString() });
+        const info = await api('/api/github/runs', { token: credentials.githubToken, projectId: active.id, repository: active.repo, branch: active.branch || 'main', since: new Date(captureAt).toISOString() });
         if (info.found) {
           const label = `${info.status}${info.conclusion ? ` · ${info.conclusion}` : ''}`;
           if (label !== last) { appendLog(active.id, `Temporary runner ${label}${info.url ? ` · ${info.url}` : ''}`, info.conclusion === 'failure' ? 'error' : 'info', 'Remote shell'); last = label; }
@@ -737,8 +784,19 @@ function App() {
   }, [projects, search]);
   const liveCount = projects.filter((project) => project.status === 'live').length;
   const tokenDaysLeft = tokenExpiry ? Math.ceil((new Date(`${tokenExpiry}T23:59:59Z`).getTime() - Date.now()) / 86_400_000) : null;
+  const currentProjectCredentialStatus = activeId ? projectCredentialStatus[activeId] || {} : {};
+  const activeEnvConfigured = {
+    ...(health.envConfigured || {}),
+    github: Boolean(health.envConfigured?.github || currentProjectCredentialStatus.githubToken),
+    render: Boolean(health.envConfigured?.render || currentProjectCredentialStatus.renderToken),
+    openrouter: Boolean(health.envConfigured?.openrouter || currentProjectCredentialStatus.openRouterKey1 || currentProjectCredentialStatus.openRouterKey2),
+  };
 
   if (loading) return <div className="app-loading"><img src="/stackpilot-icon.png" alt="" /><span>Preparing your workspace…</span></div>;
+  if (health.authRequired && !accessGranted) return <AccessGate
+    appPinRequired={health.appPinRequired} value={unlockInput} onChange={(value) => { setUnlockInput(value); setUnlockError(''); }}
+    busy={unlockBusy} error={unlockError} onSubmit={submitUnlock}
+  />;
 
   return (
     <div className="site-shell">
@@ -754,8 +812,10 @@ function App() {
         onInstallHelp={() => setInstallHelpOpen(true)} onCopyMonitor={() => navigator.clipboard?.writeText(`${window.location.origin}/health`).then(() => showToast('UptimeRobot URL copied.', 'success')).catch(() => showToast('Clipboard is unavailable in this browser.', 'error'))}
       />}
       {page === 'workspace' && active && <ProjectWorkspace
-        project={active} credentials={effectiveCredentials(active.id)} envConfigured={health.envConfigured || {}}
-        projectVault={activeVault} onVaultChange={(key, value) => setVaultField(active.id, key, value)}
+        project={active} credentials={effectiveCredentials(active.id)} envConfigured={activeEnvConfigured}
+        projectVault={activeVault} projectCredentialStatus={currentProjectCredentialStatus}
+        onVaultChange={(key, value) => setVaultField(active.id, key, value)} onLoadProjectCredentialStatus={() => loadProjectCredentialStatus(active.id)}
+        onSaveProjectCredentials={(values) => saveProjectCredentials(active.id, values)} onClearProjectCredentials={() => clearProjectCredentials(active.id)}
         envRows={projectEnv} onEnvChange={updateEnvironment} onAddEnv={addEnvironment} onRemoveEnv={removeEnvironment}
         tab={workspaceTab} setTab={setWorkspaceTab} onHome={() => setPage('start')} allProjects={projects} onOpenProject={openProject}
         monitors={monitors} onAddMonitor={addMonitor} onPingMonitor={pingMonitor} onRemoveMonitor={removeMonitor} onMonitorInterval={updateMonitorInterval} onSettings={() => setSettingsOpen(true)}
@@ -774,13 +834,34 @@ function App() {
         githubIdentity={githubIdentity} checkingGithub={checkingGithub} checkingRender={checkingRender} checkingOpenRouter={checkingOpenRouter}
         onGithubTest={testGithub} onRenderTest={testRender} onOpenRouterTest={testOpenRouter} onSaveGithubToServer={saveGithubTokenToServer}
         onSaveOpenRouterKeys={saveOpenRouterKeysToServer} onSaveAppPin={saveAppPinToServer}
-        onSave={() => { setSettingsOpen(false); showToast('Settings saved for this browser session.', 'success'); }}
+        onClearSecrets={() => { setConnectors({ openRouterKey1: '', openRouterKey2: '', githubToken: '', renderToken: '', appPassword: '', renderOwnerId: '' }); setProjectVaults({}); setProjectEnvRows({}); setUnlockInput(''); setUnlockError(''); setAccessGranted(!health.authRequired); }}
+        onSave={() => { setSettingsOpen(false); showToast('Settings saved in memory for this tab. They clear when you close or refresh the app.', 'success'); }}
         onEnableNotifications={enableNotifications} onDisableNotifications={disableNotifications} notificationReady={notificationReady} onClose={() => setSettingsOpen(false)}
       />}
       {installHelpOpen && <InstallHelp onClose={() => setInstallHelpOpen(false)} />}
       <div className="toast-stack" aria-live="polite">{toastList.map((toast) => <div className={`toast toast-${toast.tone}`} key={toast.id}><span className="toast-icon">{toast.tone === 'error' ? <AlertTriangle size={17} /> : toast.tone === 'success' ? <CheckCircle2 size={17} /> : <Activity size={17} />}</span><span>{toast.message}</span><button onClick={() => setToastList((list) => list.filter((item) => item.id !== toast.id))} aria-label="Dismiss"><X size={14} /></button></div>)}</div>
     </div>
   );
+}
+
+function AccessGate({ appPinRequired, value, onChange, busy, error, onSubmit }) {
+  return <main className="access-gate-page">
+    <div className="access-gate-top"><img src="/stackpilot-icon.png" alt="" /><div><strong>stackpilot</strong><small>PRIVATE BUILD STUDIO</small></div></div>
+    <section className="access-gate-card" aria-labelledby="access-gate-title">
+      <div className="access-gate-symbol"><LockKeyhole size={26} strokeWidth={1.8} /></div>
+      <div className="access-gate-eyebrow"><span /> PRIVATE WORKSPACE</div>
+      <h1 id="access-gate-title">Your work,<br /><em>right where you left it.</em></h1>
+      <p>Enter your {appPinRequired ? 'four-digit app PIN' : 'workspace passcode'} to open StackPilot.</p>
+      <form onSubmit={onSubmit}>
+        <label className="access-code-label" htmlFor="access-code">{appPinRequired ? 'APP PIN' : 'WORKSPACE PASSCODE'}</label>
+        <input id="access-code" className="access-code-input" type="password" inputMode={appPinRequired ? 'numeric' : 'text'} autoComplete={appPinRequired ? 'one-time-code' : 'current-password'} autoCapitalize="off" autoCorrect="off" maxLength={appPinRequired ? 4 : 128} value={value} onChange={(event) => onChange(appPinRequired ? event.target.value.replace(/\D/g, '').slice(0, 4) : event.target.value)} placeholder={appPinRequired ? '••••' : 'Enter your passcode'} aria-label={appPinRequired ? 'Four-digit app PIN' : 'Workspace passcode'} aria-invalid={Boolean(error)} />
+        {error && <div className="access-gate-error" role="alert"><AlertTriangle size={15} />{error}</div>}
+        <button className="access-unlock-button" type="submit" disabled={busy}>{busy ? <><Loader2 size={17} className="spin" /> Checking passcode…</> : <>Open my workspace <ArrowRight size={17} /></>}</button>
+      </form>
+      <div className="access-gate-foot"><ShieldCheck size={15} /> Protected by your server-side workspace code</div>
+    </section>
+    <footer className="access-gate-bottom">A focused space for building and shipping.</footer>
+  </main>;
 }
 
 function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onZipUpload, sourceMode, setSourceMode, importingGithub, onImportGithub, repo, setRepo, branch, setBranch, name, setName, autoDeploy, setAutoDeploy, onStart, projects, monitors = [], onOpen, onNew, onDelete, search, setSearch, onSettings, onAbout, onOpenMonitors, health, connectorCount, notificationsReady, onEnableNotifications, onSample, onInstallHelp, onCopyMonitor }) {
@@ -805,25 +886,33 @@ function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onZipUpl
     <main className="start-main">
       <section className="start-hero">
         <div className="hero-copy">
-          <div className="hero-kicker"><span className="kicker-sparkle">✦</span> A calm place to ship</div>
-          <h1>From one big paste<br />to <em>something live.</em></h1>
-          <p>Give StackPilot your code or idea. Five specialist steps organize it, check it, test it, and—only when checks pass—send it to Render.</p>
+          <div className="hero-kicker"><span className="kicker-sparkle">✦</span> YOUR BUILD WORKSPACE</div>
+          <h1>Start with a prompt.<br />Ship <em>something real.</em></h1>
+          <p>Paste an idea or code. Add ZIPs beside it. Review real build stages before anything is deployed.</p>
           <div className="hero-trust-row"><span><ShieldCheck size={14} /> Tests before deploy</span><span><Radio size={14} /> Live activity</span><span><Smartphone size={14} /> Built for iPhone</span></div>
         </div>
         <div className="hero-art" aria-hidden="true"><div className="hero-orbit orbit-one" /><div className="hero-orbit orbit-two" /><div className="hero-glow" /><img src="/stackpilot-icon.png" alt="" /><span className="hero-art-chip chip-left"><Check size={12} /> tests first</span><span className="hero-art-chip chip-right"><Rocket size={12} /> ready to ship</span></div>
       </section>
 
       <section className="launch-card" aria-labelledby="launch-title">
-        <div className="launch-header"><div className="launch-number">01</div><div><h2 id="launch-title">Start with your code</h2><p>Paste a dump, a brief, or files plus instructions. You can edit everything after.</p></div><button className="sample-link" onClick={onSample}><Sparkles size={14} /> Try sample</button></div>
-        <div className="source-mode-switch" role="tablist" aria-label="Choose project source"><button className={sourceMode === 'code' ? 'selected' : ''} onClick={() => setSourceMode('code')}><FileCode2 size={14} /> Code / ZIP</button><button className={sourceMode === 'github' ? 'selected' : ''} onClick={() => setSourceMode('github')}><GitBranch size={14} /> Existing GitHub repo</button></div>
-        <label className="start-field"><span>Project name <small>Optional</small></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="A name for this build" /></label>
+        <div className="launch-header"><div className="launch-number">01</div><div><h2 id="launch-title">Prompt or code</h2><p>Enter your instructions first. Add ZIP archives separately if you have existing files.</p></div><button className="sample-link" onClick={onSample}><Sparkles size={14} /> Try sample</button></div>
+        <div className="source-mode-switch" role="tablist" aria-label="Choose project source"><button className={sourceMode === 'code' ? 'selected' : ''} onClick={() => setSourceMode('code')}><FileCode2 size={14} /> Prompt & ZIP files</button><button className={sourceMode === 'github' ? 'selected' : ''} onClick={() => setSourceMode('github')}><GitBranch size={14} /> Existing GitHub repo</button></div>
         {sourceMode === 'code' ? <>
-          <label className="start-field start-dump-field"><span>Code or instructions <small>OpenRouter free model used only for pasted briefs/dumps</small></span><textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder={'Paste code or a short build brief.\n\nZIP and repository imports skip the AI organize step, saving free-model requests.'} /></label>
-          <div className="zip-upload-row"><label className="zip-file-button"><input type="file" accept=".zip,application/zip,application/x-zip-compressed" onChange={(event) => { onZipUpload(event.target.files?.[0]); event.target.value = ''; }} /><FileArchive size={15} />{zipBusy ? 'Reading ZIP…' : 'Add project ZIP'}<small>15 MB max</small></label>{zipFilename && <span className="zip-import-status"><CheckCircle2 size={13} /> {zipFilename} · {filesCount} source files/assets</span>}</div>
-          <label className="start-field"><span>GitHub destination <small>Optional for drafts</small></span><div className="start-repo-input"><Github size={16} /><input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="owner/repo or new repo name" autoCapitalize="none" autoCorrect="off" spellCheck="false" /></div></label>
+          <div className="start-intake-layout">
+            <div className="start-intake-primary">
+              <label className="start-field start-dump-field"><span>Code or instructions <small>OpenRouter free model is used only when a brief needs organizing.</small></span><textarea value={input} onChange={(event) => setInput(event.target.value)} placeholder={'Paste your prompt, code, or project brief here…\n\nYou can paste code and add ZIP archives separately.'} /></label>
+              <div className="intake-helper-line"><Sparkles size={13} /><span>Prompt first. Add context in plain language; project files stay in the Files tab.</span></div>
+            </div>
+            <aside className="zip-side-panel" aria-label="ZIP archive import">
+              <div className="zip-side-heading"><span className="zip-side-icon"><FileArchive size={17} /></span><div><strong>ZIP files</strong><small>Separate file import</small></div></div>
+              <label className={`zip-dropzone ${zipBusy ? 'is-busy' : ''}`}><input type="file" multiple accept=".zip,application/zip,application/x-zip-compressed" onChange={(event) => { onZipUpload(event.target.files); event.target.value = ''; }} /><span className="zip-drop-icon">{zipBusy ? <Loader2 size={21} className="spin" /> : <Plus size={21} />}</span><strong>{zipBusy ? 'Reading archives…' : 'Choose ZIP archives'}</strong><small>Up to 100 ZIPs · 25 MB combined</small></label>
+              {zipFilename ? <div className="zip-import-status"><CheckCircle2 size={14} /><span><strong>{zipFilename}</strong><small>{filesCount} safe project files/assets</small></span></div> : <div className="zip-limit-note">Up to 300 files and 3 MB extracted. Generated folders and unsafe files are skipped.</div>}
+            </aside>
+          </div>
+          <div className="start-project-details"><label className="start-field"><span>Project name <small>Optional</small></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="A name for this build" /></label><label className="start-field"><span>GitHub destination <small>Optional for drafts</small></span><div className="start-repo-input"><Github size={16} /><input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="owner/repo or new repo name" autoCapitalize="none" autoCorrect="off" spellCheck="false" /></div></label></div>
         </> : <>
           <label className="start-field"><span>GitHub repository <small>owner/repo or URL</small></span><div className="start-repo-input"><Github size={16} /><input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="your-name/project-name" autoCapitalize="none" autoCorrect="off" spellCheck="false" /></div></label>
-          <label className="start-field"><span>Branch <small>blank uses the repository default</small></span><input value={branch} onChange={(event) => setBranch(event.target.value)} placeholder="main" autoCapitalize="none" autoCorrect="off" /></label>
+          <div className="start-project-details"><label className="start-field"><span>Branch <small>blank uses the repository default</small></span><input value={branch} onChange={(event) => setBranch(event.target.value)} placeholder="main" autoCapitalize="none" autoCorrect="off" /></label><label className="start-field"><span>Project name <small>Optional</small></span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="A name for this build" /></label></div>
           <div className="github-import-note"><GitBranch size={14} /><span>Imports safe text and common media assets from the selected branch. Review files before the GitHub checks and optional Render release.</span></div>
         </>}
         <div className="launch-options"><label className="auto-deploy-toggle"><input type="checkbox" checked={autoDeploy} onChange={(event) => setAutoDeploy(event.target.checked)} /><span className="toggle-ui" /><span><strong>Auto-deploy after checks pass</strong><small>Turn off to review the tested GitHub build before publishing.</small></span></label><span className="plan-chip"><Cloud size={13} /> Render Free</span></div>
@@ -862,7 +951,7 @@ function ProjectCard({ project, monitor, onOpen, onDelete }) {
   </article>;
 }
 
-function ProjectWorkspace({ project, credentials, envConfigured, projectVault, onVaultChange, envRows, onEnvChange, onAddEnv, onRemoveEnv, tab, setTab, onHome, allProjects = [], onOpenProject, monitors = [], onAddMonitor, onPingMonitor, onRemoveMonitor, onMonitorInterval, onSettings, onNameChange, onRepoChange, onProjectChange, onRun, onToggleAutoDeploy, busy, onDelete, onEditorChange, editorDraft, editorDirty, onSaveEditor, onSelectFile, onAddFile, onAbout, onOpenMonitors, onShowToast, onRefreshEnv, shellCommand, setShellCommand, shellBusy, onRunShell }) {
+function ProjectWorkspace({ project, credentials, envConfigured, projectVault, projectCredentialStatus, onVaultChange, onLoadProjectCredentialStatus, onSaveProjectCredentials, onClearProjectCredentials, envRows, onEnvChange, onAddEnv, onRemoveEnv, tab, setTab, onHome, allProjects = [], onOpenProject, monitors = [], onAddMonitor, onPingMonitor, onRemoveMonitor, onMonitorInterval, onSettings, onNameChange, onRepoChange, onProjectChange, onRun, onToggleAutoDeploy, busy, onDelete, onEditorChange, editorDraft, editorDirty, onSaveEditor, onSelectFile, onAddFile, onAbout, onOpenMonitors, onShowToast, onRefreshEnv, shellCommand, setShellCommand, shellBusy, onRunShell }) {
   const progress = calculateProgress(project.steps, project.status, project.progress);
   const isWorking = ['queued', 'running', 'deploying'].includes(project.status);
   const canDeploy = Boolean(project.renderUrl || project.renderServiceId || credentials.renderToken || envConfigured.render);
@@ -924,7 +1013,7 @@ function ProjectWorkspace({ project, credentials, envConfigured, projectVault, o
 
       {tab === 'deploy' && <div className="preview-layout">
         <section className="workspace-card live-preview-card"><div className="card-header"><div className="card-title-icon green"><Eye size={16} /></div><div><strong>Live browser preview</strong><span>{project.renderUrl ? 'The deployed Render site, embedded here.' : 'A real preview appears as soon as Render finishes a successful deploy.'}</span></div>{project.renderUrl && <a className="small-action" href={project.renderUrl} target="_blank" rel="noreferrer"><ExternalLink size={13} /> Open tab</a>}</div>{project.renderUrl ? <div className="embedded-browser"><div className="browser-chrome"><span /><span /><span /><div className="browser-address"><LockKeyhole size={10} />{project.renderUrl.replace(/^https?:\/\//, '')}</div><button onClick={() => window.open(project.renderUrl, '_blank', 'noopener,noreferrer')} aria-label="Open preview in a new tab"><ArrowUpRight size={13} /></button></div><iframe title={`Live preview of ${project.name}`} src={project.renderUrl} loading="lazy" referrerPolicy="no-referrer" /></div> : <div className="preview-empty"><div className="preview-orb"><Globe size={22} /></div><strong>{project.status === 'verified' ? 'Checks passed. Ready for Render.' : 'Your live preview will appear here.'}</strong><span>{project.status === 'verified' ? 'Turn on auto-deploy or use “Deploy verified build”.' : 'The Render operator only starts after GitHub tests and build succeed.'}</span>{project.status === 'verified' && <button className="primary-button" onClick={runClick} disabled={busy}><Rocket size={15} /> Deploy verified build</button>}</div>}</section>
-        <ProjectCredentialsCard vault={projectVault} onChange={onVaultChange} />
+        <ProjectCredentialsCard projectId={project.id} vault={projectVault} status={projectCredentialStatus || {}} onChange={onVaultChange} onLoadStatus={onLoadProjectCredentialStatus} onSave={onSaveProjectCredentials} onClear={onClearProjectCredentials} onSettings={onSettings} />
         <EnvironmentCard rows={envRows} onChange={onEnvChange} onAdd={onAddEnv} onRemove={onRemoveEnv} onRefresh={onRefreshEnv} serviceId={project.renderServiceId} envConfigured={envConfigured} credentials={credentials} />
         <div className="preview-bottom-grid"><ReleaseSettings project={project} onRepoChange={onRepoChange} onToggleAutoDeploy={onToggleAutoDeploy} onProjectChange={onProjectChange} onSettings={onSettings} /><RenderStatusCard project={project} onSettings={onSettings} /></div>
       </div>}
@@ -975,7 +1064,7 @@ function ActivityPanel({ project, onClear }) {
 
 function ReleaseSummary({ project, canDeploy, autoDeploy, onToggleAutoDeploy, onRun, busy, onSettings }) {
   const finished = ['live', 'verified'].includes(project.status);
-  return <section className="release-summary workspace-card"><div className="release-summary-head"><div className="card-title-icon green"><Rocket size={15} /></div><div><strong>Release gate</strong><span>Render waits for GitHub success</span></div><span className="free-chip"><i /> FREE</span></div><div className="release-repo-line"><Github size={14} /><span>{project.repo || 'Add owner/repo in release settings'}</span></div><label className="release-auto-toggle"><input type="checkbox" checked={autoDeploy} onChange={(event) => onToggleAutoDeploy(event.target.checked)} /><span className="toggle-ui small-toggle" /><span><strong>Auto-deploy</strong><small>{autoDeploy ? 'Publish after checks pass' : 'Review, then deploy manually'}</small></span></label>{project.status === 'verified' && !autoDeploy && <button className="primary-button side-deploy-button" onClick={onRun} disabled={busy}><Rocket size={14} /> Deploy verified build</button>}{project.renderUrl && <a className="release-live-link" href={project.renderUrl} target="_blank" rel="noreferrer"><Globe size={14} /><span>{project.renderUrl.replace(/^https?:\/\//, '')}</span><ArrowUpRight size={13} /></a>}{!canDeploy && <div className="release-needs-key"><KeyRound size={13} /> Add a Render key in Settings to publish.</div>}<button className="release-settings-link" onClick={onSettings}><Settings2 size={13} /> Configure Render & connections</button>{finished && project.lastCommitUrl && <a className="commit-link" href={project.lastCommitUrl} target="_blank" rel="noreferrer"><CheckCircle2 size={13} /> View verified GitHub commit <ExternalLink size={12} /></a>}</section>;
+  return <section className="release-summary workspace-card"><div className="release-summary-head"><div className="card-title-icon green"><Rocket size={15} /></div><div><strong>Release gate</strong><span>Render waits for GitHub success</span></div><span className="free-chip"><i /> FREE</span></div><div className="release-repo-line"><Github size={14} /><span>{project.repo || 'Add owner/repo in release settings'}</span></div><label className="release-auto-toggle"><input type="checkbox" checked={autoDeploy} onChange={(event) => onToggleAutoDeploy(event.target.checked)} /><span className="toggle-ui small-toggle" /><span><strong>Auto-deploy</strong><small>{autoDeploy ? 'Publish after checks pass' : 'Review, then deploy manually'}</small></span></label>{project.status === 'verified' && !autoDeploy && <button className="primary-button side-deploy-button" onClick={onRun} disabled={busy}><Rocket size={14} /> Deploy verified build</button>}{project.renderUrl && <a className="release-live-link" href={project.renderUrl} target="_blank" rel="noreferrer"><Globe size={14} /><span>{project.renderUrl.replace(/^https?:\/\//, '')}</span><ArrowUpRight size={13} /></a>}{!canDeploy && <div className="release-needs-key"><KeyRound size={13} /> Add a Render key for this project or set the workspace fallback in Settings.</div>}<button className="release-settings-link" onClick={onSettings}><Settings2 size={13} /> Configure Render & connections</button>{finished && project.lastCommitUrl && <a className="commit-link" href={project.lastCommitUrl} target="_blank" rel="noreferrer"><CheckCircle2 size={13} /> View verified GitHub commit <ExternalLink size={12} /></a>}</section>;
 }
 
 function ReleaseSettings({ project, onRepoChange, onToggleAutoDeploy, onProjectChange, onSettings }) {
@@ -991,14 +1080,59 @@ function ReleaseSettings({ project, onRepoChange, onToggleAutoDeploy, onProjectC
   </section>;
 }
 
-function ProjectCredentialsCard({ vault, onChange }) {
-  return <section className="workspace-card project-credentials-card"><div className="card-header"><div className="card-title-icon blue"><KeyRound size={16} /></div><div><strong>Project-specific platform keys</strong><span>Optional overrides for this project only. These values stay in this browser session.</span></div></div><div className="project-credential-grid"><label className="settings-field-inline"><span>GitHub token override</span><input type="password" autoComplete="new-password" value={vault.githubToken || ''} onChange={(event) => onChange('githubToken', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>Render API key override</span><input type="password" autoComplete="new-password" value={vault.renderToken || ''} onChange={(event) => onChange('renderToken', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>OpenRouter key 1</span><input type="password" autoComplete="new-password" value={vault.openRouterKey1 || ''} onChange={(event) => onChange('openRouterKey1', event.target.value)} placeholder="Use workspace default" /></label><label className="settings-field-inline"><span>OpenRouter key 2</span><input type="password" autoComplete="new-password" value={vault.openRouterKey2 || ''} onChange={(event) => onChange('openRouterKey2', event.target.value)} placeholder="Use workspace default" /></label></div><div className="env-note"><ShieldCheck size={13} /> Overrides are not saved with project files and are never pushed to GitHub.</div></section>;
+function ProjectCredentialsCard({ projectId, vault, status, onChange, onLoadStatus, onSave, onClear, onSettings }) {
+  const [saving, setSaving] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingStatus(true);
+    Promise.resolve(onLoadStatus?.()).catch((loadError) => {
+      if (!cancelled) setError(loadError.message || 'Could not load saved key status.');
+    }).finally(() => { if (!cancelled) setLoadingStatus(false); });
+    return () => { cancelled = true; };
+  }, [projectId]);
+  const fields = [
+    ['githubToken', 'GitHub token override', 'Use workspace default'],
+    ['renderToken', 'Render API key override', 'Use workspace default'],
+    ['openRouterKey1', 'OpenRouter key 1', 'Use workspace default'],
+    ['openRouterKey2', 'OpenRouter key 2', 'Optional fallback key'],
+  ];
+  const savedCount = Object.values(status || {}).filter(Boolean).length;
+  const save = async () => {
+    const values = Object.fromEntries(fields.map(([key]) => [key, String(vault?.[key] || '').trim()]).filter(([, value]) => value));
+    if (!Object.keys(values).length && !String(vault?.renderOwnerId || '').trim()) { setError('Enter at least one project key or owner ID first.'); return; }
+    if (String(vault?.renderOwnerId || '').trim()) values.renderOwnerId = String(vault.renderOwnerId).trim();
+    setSaving(true); setError(''); setMessage('');
+    try {
+      await onSave(values);
+      Object.keys(values).forEach((key) => onChange(key, ''));
+      setMessage('Saved on the StackPilot Render service.');
+    } catch (saveError) { setError(saveError.message || 'Could not save project keys.'); }
+    finally { setSaving(false); }
+  };
+  const clear = async () => {
+    if (!savedCount || !window.confirm(`Clear all ${savedCount} saved platform key${savedCount === 1 ? '' : 's'} for this project from StackPilot Render?`)) return;
+    setClearing(true); setError(''); setMessage('');
+    try { await onClear(); setMessage('Saved project keys cleared.'); }
+    catch (clearError) { setError(clearError.message || 'Could not clear saved project keys.'); }
+    finally { setClearing(false); }
+  };
+  return <section className="workspace-card project-credentials-card">
+    <div className="card-header"><div className="card-title-icon blue"><KeyRound size={16} /></div><div><strong>Project platform keys</strong><span>Overrides for this project only. Save them server-side or use workspace defaults.</span></div><span className={`settings-state ${savedCount ? 'ready' : ''}`}>{loadingStatus ? 'CHECKING' : `${savedCount} SAVED`}</span></div>
+    <div className="project-credential-grid">{fields.map(([key, label, emptyHint]) => <label className="settings-field-inline" key={key}><span>{label}{status?.[key] && <small className="credential-saved-label"> · SAVED</small>}</span><input type="password" autoComplete="new-password" value={vault?.[key] || ''} onChange={(event) => onChange(key, event.target.value)} placeholder={status?.[key] ? 'Saved on StackPilot Render' : emptyHint} /></label>)}<label className="settings-field-inline"><span>Render owner / workspace ID{status?.renderOwnerId && <small className="credential-saved-label"> · SAVED</small>}</span><input autoCapitalize="none" autoCorrect="off" value={vault?.renderOwnerId || ''} onChange={(event) => onChange('renderOwnerId', event.target.value)} placeholder={status?.renderOwnerId ? 'Saved on StackPilot Render' : 'Use workspace default'} /></label></div>
+    {(error || message) && <div className={`project-credentials-message ${error ? 'is-error' : ''}`} role={error ? 'alert' : 'status'}>{error || message}</div>}
+    <div className="project-credentials-actions"><button className="primary-button" onClick={save} disabled={saving || clearing || loadingStatus}>{saving ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save filled keys to Render</button>{savedCount > 0 && <button className="soft-button" onClick={clear} disabled={saving || clearing}>{clearing ? <Loader2 size={14} className="spin" /> : <Trash2 size={14} />} Clear saved keys</button>}<button className="small-action" onClick={onSettings}>Workspace keys <Settings2 size={13} /></button></div>
+    <div className="env-note"><ShieldCheck size={13} /> Saved keys live in the StackPilot service’s Render environment—not the deployed project—and Render stores them as secrets. Saving queues a service restart. Unsaved values exist in page memory only and clear on refresh.</div>
+  </section>;
 }
 
 function EnvironmentCard({ rows, onChange, onAdd, onRemove, onRefresh, serviceId, envConfigured, credentials }) {
   const [visible, setVisible] = useState(false);
   const populated = rows.filter((row) => row.key && row.value).length;
-  return <section className="workspace-card env-card"><div className="card-header"><div className="card-title-icon amber"><KeyRound size={16} /></div><div><strong>Project environment</strong><span>Detected from .env.example and source usage; values stay in this browser until sent to Render.</span></div><button className="small-action" onClick={() => setVisible((value) => !value)}>{visible ? 'Hide values' : 'Show values'}</button></div>
+  return <section className="workspace-card env-card"><div className="card-header"><div className="card-title-icon amber"><KeyRound size={16} /></div><div><strong>Project environment</strong><span>Detected from source. Values stay in memory until sent to this project’s Render service.</span></div><button className="small-action" onClick={() => setVisible((value) => !value)}>{visible ? 'Hide values' : 'Show values'}</button></div>
     {!rows.length ? <div className="env-empty"><span><Sparkles size={15} /></span><div><strong>No environment keys detected</strong><small>Add keys your deployed app needs. They are never committed to GitHub.</small></div></div> : <div className="env-table">{rows.map((row, index) => <div className="env-row" key={`${row.key}_${index}`}><input className="env-key-input" value={row.key} onChange={(event) => onChange(index, 'key', event.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '_'))} placeholder="API_KEY" aria-label="Environment variable name" /><input className="env-value-input" type={visible ? 'text' : 'password'} value={row.value || ''} onChange={(event) => onChange(index, 'value', event.target.value)} placeholder="Add secret value" aria-label={`Value for ${row.key || 'environment variable'}`} /><button className="icon-only danger-icon" onClick={() => onRemove(index)} aria-label={`Remove ${row.key || 'environment variable'}`}><X size={14} /></button></div>)}</div>}
     <div className="env-footer"><button className="small-action" onClick={onAdd}><Plus size={13} /> Add variable</button><span>{serviceId ? `Render service linked · ${populated} value${populated === 1 ? '' : 's'} ready` : 'Values are sent only when the Render service is created.'}</span><button className="small-action" onClick={onRefresh}><RefreshIcon /> Scan source</button></div>
     <div className="env-note"><ShieldCheck size={13} /> Platform keys: GitHub {envConfigured.github ? 'from server environment' : credentials.githubToken ? 'connected for this session' : 'not connected'} · Render {envConfigured.render ? 'from server environment' : credentials.renderToken ? 'connected for this session' : 'not connected'}</div>
@@ -1037,7 +1171,7 @@ function FileTree({ files, current, onSelect }) {
 }
 
 function RenderStatusCard({ project, onSettings }) {
-  return <section className="workspace-card render-status-card"><div className="card-header"><div className="card-title-icon green"><Cloud size={16} /></div><div><strong>Render status</strong><span>Configured from your release settings.</span></div></div><div className="render-status-line"><span className={`status-light ${project.status === 'live' ? 'light-green' : project.status === 'deploying' ? 'light-violet' : ''}`} /><strong>{project.status === 'live' ? 'Live' : project.status === 'deploying' ? 'Building' : project.status === 'verified' ? 'Waiting for deploy' : 'Not deployed yet'}</strong></div>{project.renderServiceId && <div className="service-id-line">Service <code>{project.renderServiceId}</code></div>}{project.renderDashboardUrl && <a className="small-action" href={project.renderDashboardUrl} target="_blank" rel="noreferrer"><Cloud size={13} /> Open Render dashboard <ExternalLink size={12} /></a>}<button className="small-action" onClick={onSettings}><KeyRound size={13} /> Edit Render key</button></section>;
+  return <section className="workspace-card render-status-card"><div className="card-header"><div className="card-title-icon green"><Cloud size={16} /></div><div><strong>Render status</strong><span>Configured from your release settings.</span></div></div><div className="render-status-line"><span className={`status-light ${project.status === 'live' ? 'light-green' : project.status === 'deploying' ? 'light-violet' : ''}`} /><strong>{project.status === 'live' ? 'Live' : project.status === 'deploying' ? 'Building' : project.status === 'verified' ? 'Waiting for deploy' : 'Not deployed yet'}</strong></div>{project.renderServiceId && <div className="service-id-line">Service <code>{project.renderServiceId}</code></div>}{project.renderDashboardUrl && <a className="small-action" href={project.renderDashboardUrl} target="_blank" rel="noreferrer"><Cloud size={13} /> Open Render dashboard <ExternalLink size={12} /></a>}<button className="small-action" onClick={onSettings}><KeyRound size={13} /> Workspace Render key</button></section>;
 }
 
 function AboutPage({ projects, onBack, expiry, daysLeft, health, onSettings, onOpenMonitors, onOpen }) {
@@ -1046,7 +1180,7 @@ function AboutPage({ projects, onBack, expiry, daysLeft, health, onSettings, onO
   const commits = projects.filter((project) => project.lastCommit).length;
   const exactExpiry = expiry ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeZone: 'UTC' }).format(new Date(`${expiry}T12:00:00Z`)) : '';
   const expiryText = expiry ? `${exactExpiry} · ${daysLeft < 0 ? `expired ${Math.abs(daysLeft)} day${Math.abs(daysLeft) === 1 ? '' : 's'} ago` : daysLeft === 0 ? 'expires today' : `expires in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`}` : 'Add a reminder date in Settings';
-  return <div className="about-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Workspace</button><ChevronRight size={13} /><span>My work</span></div><div className="workspace-header-actions"><button className="header-link" onClick={onOpenMonitors}><Wifi size={15} /><span>Monitors</span></button><button className="header-settings" onClick={onSettings}><Settings2 size={17} /></button></div></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">ABOUT YOUR WORKSPACE</span><h1>Built to make progress visible.</h1><p>StackPilot turns a code dump into a reviewed GitHub commit, a real hosted build, and a live Render link.</p></div><div className="about-stat-grid"><div><strong>{projects.length}</strong><span>projects saved</span></div><div><strong>{live}</strong><span>live on Render</span></div><div><strong>{commits}</strong><span>GitHub commits</span></div><div><strong>{working}</strong><span>runs in progress</span></div></div><div className="about-detail-grid"><section className="workspace-card about-card"><div className="card-title-icon violet"><Github size={16} /></div><div><strong>GitHub token reminder</strong><span>GitHub does not reveal a PAT's expiry date through this integration. Add the date you chose when creating it; StackPilot will remind you at 7, 3, 1, and 0 days when notifications are enabled.</span></div><div className={`expiry-status ${daysLeft !== null && daysLeft <= 7 ? 'expiry-warning' : ''}`}><CalendarDays size={15} />{expiryText}</div><button className="soft-button" onClick={onSettings}>Manage token & reminder <ArrowRight size={14} /></button></section><section className="workspace-card about-card"><div className="card-title-icon green"><Radio size={16} /></div><div><strong>UptimeRobot endpoint</strong><span>Use this public URL for a simple HTTP(S) monitor. It stays outside the workspace password.</span></div><div className="monitor-url"><code>{typeof window !== 'undefined' ? `${window.location.origin}/health` : '/health'}</code><button onClick={() => navigator.clipboard?.writeText(`${window.location.origin}/health`)}><Copy size={13} /></button></div><div className="health-fact">{health?.ok ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}{health?.ok ? "StackPilot health is reachable. Monitor /health in UptimeRobot." : "The health endpoint could not be reached just now."}</div></section></div><section className="about-projects"><div className="recent-heading"><div><span className="section-eyebrow">PROJECT HISTORY</span><h2>Your work</h2></div><button className="soft-button" onClick={onSettings}>Settings <Settings2 size={14} /></button></div>{projects.length ? <div className="recent-grid">{projects.slice(0, 8).map((project) => <button className="about-project-row" key={project.id} onClick={() => onOpen(project.id)}><span className={`project-dot project-${project.status}`} /><span><strong>{project.name}</strong><small>{project.repo || 'Draft on this device'} · {timeAgo(project.updatedAt)}</small></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span><ArrowRight size={14} /></button>)}</div> : <div className="recent-empty"><strong>No projects yet</strong><span>Your first build will appear here.</span></div>}</section><p className="about-caveat">Drafts and project-specific environment values are stored in this browser session/device. GitHub is the durable source copy. Keep a separate backup of production credentials.</p></main></div>;
+  return <div className="about-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Workspace</button><ChevronRight size={13} /><span>My work</span></div><div className="workspace-header-actions"><button className="header-link" onClick={onOpenMonitors}><Wifi size={15} /><span>Monitors</span></button><button className="header-settings" onClick={onSettings}><Settings2 size={17} /></button></div></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">ABOUT YOUR WORKSPACE</span><h1>Built to make progress visible.</h1><p>StackPilot turns a code dump into a reviewed GitHub commit, a real hosted build, and a live Render link.</p></div><div className="about-stat-grid"><div><strong>{projects.length}</strong><span>projects saved</span></div><div><strong>{live}</strong><span>live on Render</span></div><div><strong>{commits}</strong><span>GitHub commits</span></div><div><strong>{working}</strong><span>runs in progress</span></div></div><div className="about-detail-grid"><section className="workspace-card about-card"><div className="card-title-icon violet"><Github size={16} /></div><div><strong>GitHub token reminder</strong><span>GitHub does not reveal a PAT's expiry date through this integration. Add the date you chose when creating it; StackPilot will remind you at 7, 3, 1, and 0 days when notifications are enabled.</span></div><div className={`expiry-status ${daysLeft !== null && daysLeft <= 7 ? 'expiry-warning' : ''}`}><CalendarDays size={15} />{expiryText}</div><button className="soft-button" onClick={onSettings}>Manage token & reminder <ArrowRight size={14} /></button></section><section className="workspace-card about-card"><div className="card-title-icon green"><Radio size={16} /></div><div><strong>UptimeRobot endpoint</strong><span>Use this public URL for a simple HTTP(S) monitor. It stays outside the workspace password.</span></div><div className="monitor-url"><code>{typeof window !== 'undefined' ? `${window.location.origin}/health` : '/health'}</code><button onClick={() => navigator.clipboard?.writeText(`${window.location.origin}/health`)}><Copy size={13} /></button></div><div className="health-fact">{health?.ok ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}{health?.ok ? "StackPilot health is reachable. Monitor /health in UptimeRobot." : "The health endpoint could not be reached just now."}</div></section></div><section className="about-projects"><div className="recent-heading"><div><span className="section-eyebrow">PROJECT HISTORY</span><h2>Your work</h2></div><button className="soft-button" onClick={onSettings}>Settings <Settings2 size={14} /></button></div>{projects.length ? <div className="recent-grid">{projects.slice(0, 8).map((project) => <button className="about-project-row" key={project.id} onClick={() => onOpen(project.id)}><span className={`project-dot project-${project.status}`} /><span><strong>{project.name}</strong><small>{project.repo || 'Draft on this device'} · {timeAgo(project.updatedAt)}</small></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span><ArrowRight size={14} /></button>)}</div> : <div className="recent-empty"><strong>No projects yet</strong><span>Your first build will appear here.</span></div>}</section><p className="about-caveat">Drafts are stored on this device. Unsaved platform keys exist only in page memory; saved platform keys and runtime secrets live in Render environment variables. GitHub is the durable source copy. Keep a separate backup of production credentials.</p></main></div>;
 }
 
 function durationText(start) {
@@ -1112,8 +1246,7 @@ function DeploymentsPage({ projects, onBack, onOpen }) {
   return <div className="about-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Projects</button><ChevronRight size={13} /><span>Deployments</span></div></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">RELEASE HISTORY</span><h1>Every deploy, in one place.</h1><p>Render only receives a project after its current GitHub build and tests pass.</p></div>{deployed.length ? <div className="deployment-list">{deployed.map((project) => <button key={project.id} onClick={() => onOpen(project.id)}><span className={`project-dot project-${project.status}`} /><span><strong>{project.name}</strong><small>{project.repo || 'No repository linked'}</small></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span><span className="deployment-url">{project.renderUrl || 'Waiting for first Render deployment'}</span><ArrowUpRight size={15} /></button>)}</div> : <div className="recent-empty"><strong>No releases yet.</strong><span>Start a project and enable Auto-deploy to publish after successful checks.</span></div>}</main></div>;
 }
 
-function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setTokenExpiry, githubIdentity, checkingGithub, checkingRender, checkingOpenRouter, onGithubTest, onRenderTest, onOpenRouterTest, onSaveGithubToServer, onSaveOpenRouterKeys, onSaveAppPin, onSave, onEnableNotifications, onDisableNotifications, notificationReady, onClose }) {
-  const [serverToken, setServerToken] = useState('');
+function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setTokenExpiry, githubIdentity, checkingGithub, checkingRender, checkingOpenRouter, onGithubTest, onRenderTest, onOpenRouterTest, onSaveGithubToServer, onSaveOpenRouterKeys, onSaveAppPin, onClearSecrets, onSave, onEnableNotifications, onDisableNotifications, notificationReady, onClose }) {
   const [serverExpiry, setServerExpiry] = useState(tokenExpiry || '');
   const [savingServerToken, setSavingServerToken] = useState(false);
   const [savingServerOpenRouter, setSavingServerOpenRouter] = useState(false);
@@ -1122,8 +1255,10 @@ function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setToke
   const [confirmAppPin, setConfirmAppPin] = useState('');
   const update = (key, value) => setConnectors((current) => ({ ...current, [key]: value }));
   const saveServerToken = async () => {
+    const token = String(connectors.githubToken || '').trim();
+    if (!token) { window.alert('Paste a newly rotated GitHub token in the GitHub field first.'); return; }
     setSavingServerToken(true);
-    try { await onSaveGithubToServer(serverToken, serverExpiry); setTokenExpiry(serverExpiry); setServerToken(''); }
+    try { await onSaveGithubToServer(token, serverExpiry); setTokenExpiry(serverExpiry); }
     catch (error) { window.alert(error.message || 'Could not save token.'); }
     finally { setSavingServerToken(false); }
   };
@@ -1143,17 +1278,16 @@ function SettingsModal({ connectors, setConnectors, health, tokenExpiry, setToke
   return <div className="modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-heading">
     <div className="modal-header"><div className="modal-icon"><Settings2 size={18} /></div><div><h2 id="settings-heading">Settings & connections</h2><p>Use fresh credentials. Secrets never enter project files or the GitHub commit.</p></div><button className="icon-only modal-close" onClick={onClose} aria-label="Close settings"><X size={18} /></button></div>
     <div className="modal-body">
-      {health.authRequired && <div className="settings-card unlock-card"><div className="settings-section-heading"><span className="card-title-icon amber"><LockKeyhole size={15} /></span><div><strong>Workspace access code</strong><small>{health.appPinRequired ? 'Enter the four-digit App PIN.' : 'Enter the existing workspace password.'}</small></div></div><label className="settings-field-inline"><span>{health.appPinRequired ? '4-digit APP_PIN' : 'Current workspace password'}</span><input type="password" inputMode={health.appPinRequired ? 'numeric' : 'text'} maxLength={health.appPinRequired ? 4 : undefined} autoComplete="current-password" value={connectors.appPassword} onChange={(event) => update('appPassword', health.appPinRequired ? event.target.value.replace(/\D/g, '').slice(0, 4) : event.target.value)} placeholder={health.appPinRequired ? '••••' : 'Enter the current password'} /></label></div>}
-      <div className="settings-card openrouter-settings-card"><div className="settings-section-heading"><span className="card-title-icon violet"><Sparkles size={15} /></span><div><strong>OpenRouter · free models only</strong><small>Task-focused code organization and targeted repair.</small></div><span className={`settings-state ${connectors.openRouterKey1 || connectors.openRouterKey2 || health.envConfigured?.openrouter ? 'ready' : ''}`}>{connectors.openRouterKey1 || connectors.openRouterKey2 || health.envConfigured?.openrouter ? 'READY' : 'ADD KEY'}</span></div><label className="settings-field-inline"><span>OpenRouter key 1</span><input type="password" autoComplete="new-password" value={connectors.openRouterKey1} onChange={(event) => update('openRouterKey1', event.target.value)} placeholder="sk-or-v1-…" /></label><label className="settings-field-inline"><span>OpenRouter key 2 <small>optional fallback</small></span><input type="password" autoComplete="new-password" value={connectors.openRouterKey2} onChange={(event) => update('openRouterKey2', event.target.value)} placeholder="Second key for rotation" /></label><small className="field-help">Requests are restricted to OpenRouter’s free router; two keys rotate on requests/errors but do not guarantee more quota or uptime. Free models can still return 429s or be unavailable.</small><div className="settings-inline-actions"><button className="soft-button" onClick={onOpenRouterTest} disabled={checkingOpenRouter}>{checkingOpenRouter ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test OpenRouter keys</button><span>Quota check uses the key endpoint, not a model inference.</span></div><details className="server-secret-details"><summary>Save model keys in Render environment</summary><p>Requires a fresh Render API key above. Keys are stored as Render secrets and only the free router is used. Saving queues a service deploy.</p><button className="primary-button save-server-token" onClick={saveOpenRouterKeys} disabled={savingServerOpenRouter || !connectors.openRouterKey1}>{savingServerOpenRouter ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save OpenRouter keys to Render</button></details></div>
-      <div className="settings-card app-pin-settings-card"><div className="settings-section-heading"><span className="card-title-icon amber"><LockKeyhole size={15} /></span><div><strong>Set a four-digit App PIN</strong><small>Writes APP_PIN to Render and queues a restart.</small></div><span className={`settings-state ${health.appPinRequired ? 'ready' : ''}`}>{health.appPinRequired ? 'PIN ON' : 'PASSWORD'}</span></div><div className="pin-field-row"><label className="settings-field-inline"><span>New PIN</span><input type="password" inputMode="numeric" autoComplete="new-password" maxLength="4" value={newAppPin} onChange={(event) => setNewAppPin(event.target.value.replace(/\D/g, '').slice(0, 4))} placeholder="4 digits" /></label><label className="settings-field-inline"><span>Confirm PIN</span><input type="password" inputMode="numeric" autoComplete="new-password" maxLength="4" value={confirmAppPin} onChange={(event) => setConfirmAppPin(event.target.value.replace(/\D/g, '').slice(0, 4))} placeholder="Repeat PIN" /></label></div><small className="field-help">A four-digit PIN is weaker than a passphrase. StackPilot blocks local API brute-force attempts, but Render Free restarts can reset its in-memory limit. A Render API key is required.</small><button className="primary-button save-server-token" onClick={saveAppPin} disabled={savingServerPin || newAppPin.length !== 4 || confirmAppPin.length !== 4}>{savingServerPin ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save PIN in Render</button></div>
-      <div className="settings-card"><div className="settings-section-heading"><span className="card-title-icon blue"><Github size={15} /></span><div><strong>GitHub</strong><small>Push code and start the real Actions build runner.</small></div><span className={`settings-state ${connectors.githubToken || health.envConfigured?.github ? 'ready' : ''}`}>{githubIdentity || (health.envConfigured?.github ? 'SERVER KEY' : connectors.githubToken ? 'SESSION KEY' : 'ADD KEY')}</span></div><label className="settings-field-inline"><span>Session token <small>optional if server token is saved</small></span><input type="password" autoComplete="new-password" value={connectors.githubToken} onChange={(event) => update('githubToken', event.target.value)} placeholder="github_pat_…" /></label><div className="settings-inline-actions"><button className="soft-button" onClick={onGithubTest} disabled={checkingGithub}>{checkingGithub ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test GitHub</button><span>Fine-grained token: Contents read/write, Actions read/write, Metadata read.</span></div>
-        <details className="server-secret-details"><summary>Save a fresh token in Render environment</summary><p>Stores the token as the private GITHUB_TOKEN environment variable on this StackPilot service. The app restarts after saving. Never use an exposed or revoked token here.</p><label className="settings-field-inline"><span>New GitHub token</span><input type="password" autoComplete="new-password" value={serverToken} onChange={(event) => setServerToken(event.target.value)} placeholder="Paste a newly rotated token" /></label><label className="settings-field-inline"><span>Token expiry date <small>manual reminder</small></span><input type="date" value={serverExpiry} onChange={(event) => setServerExpiry(event.target.value)} /></label><button className="primary-button save-server-token" onClick={saveServerToken} disabled={savingServerToken || !serverToken}>{savingServerToken ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save token securely to Render</button></details>
+      <div className="settings-card openrouter-settings-card"><div className="settings-section-heading"><span className="card-title-icon violet"><Sparkles size={15} /></span><div><strong>OpenRouter · free models only</strong><small>Workspace fallback; per-project overrides are available in each project’s Deploy & Render tab.</small></div><span className={`settings-state ${connectors.openRouterKey1 || connectors.openRouterKey2 || health.envConfigured?.openrouter ? 'ready' : ''}`}>{connectors.openRouterKey1 || connectors.openRouterKey2 || health.envConfigured?.openrouter ? 'READY' : 'ADD KEY'}</span></div><label className="settings-field-inline"><span>OpenRouter key 1</span><input type="password" autoComplete="new-password" value={connectors.openRouterKey1} onChange={(event) => update('openRouterKey1', event.target.value)} placeholder="sk-or-v1-…" /></label><label className="settings-field-inline"><span>OpenRouter key 2 <small>optional fallback</small></span><input type="password" autoComplete="new-password" value={connectors.openRouterKey2} onChange={(event) => update('openRouterKey2', event.target.value)} placeholder="Second key for rotation" /></label><small className="field-help">Requests are restricted to OpenRouter’s free router; two keys rotate on requests/errors but do not guarantee more quota or uptime. Free models can still return 429s or be unavailable.</small><div className="settings-inline-actions"><button className="soft-button" onClick={onOpenRouterTest} disabled={checkingOpenRouter}>{checkingOpenRouter ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test OpenRouter keys</button><span>Quota check uses the key endpoint, not a model inference.</span></div><details className="server-secret-details"><summary>Save model keys in Render environment</summary><p>Requires a fresh Render API key above. Keys are stored as Render secrets and only the free router is used. Saving queues a service deploy.</p><button className="primary-button save-server-token" onClick={saveOpenRouterKeys} disabled={savingServerOpenRouter || !connectors.openRouterKey1}>{savingServerOpenRouter ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save OpenRouter keys to Render</button></details></div>
+      <div className="settings-card app-pin-settings-card"><div className="settings-section-heading"><span className="card-title-icon amber"><LockKeyhole size={15} /></span><div><strong>Set a four-digit App PIN</strong><small>Writes APP_PIN to Render. The lock screen opens before the workspace.</small></div><span className={`settings-state ${health.appPinRequired ? 'ready' : ''}`}>{health.appPinRequired ? 'PIN ON' : 'PASSWORD'}</span></div><div className="pin-field-row"><label className="settings-field-inline"><span>New PIN</span><input type="password" inputMode="numeric" autoComplete="new-password" maxLength="4" value={newAppPin} onChange={(event) => setNewAppPin(event.target.value.replace(/\D/g, '').slice(0, 4))} placeholder="4 digits" /></label><label className="settings-field-inline"><span>Confirm PIN</span><input type="password" inputMode="numeric" autoComplete="new-password" maxLength="4" value={confirmAppPin} onChange={(event) => setConfirmAppPin(event.target.value.replace(/\D/g, '').slice(0, 4))} placeholder="Repeat PIN" /></label></div><small className="field-help">A four-digit PIN is weaker than a passphrase. StackPilot blocks local API brute-force attempts, but Render Free restarts can reset its in-memory limit. A Render API key is required.</small><button className="primary-button save-server-token" onClick={saveAppPin} disabled={savingServerPin || newAppPin.length !== 4 || confirmAppPin.length !== 4}>{savingServerPin ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save PIN in Render</button></div>
+      <div className="settings-card"><div className="settings-section-heading"><span className="card-title-icon blue"><Github size={15} /></span><div><strong>GitHub</strong><small>Push code and start the real Actions build runner.</small></div><span className={`settings-state ${connectors.githubToken || health.envConfigured?.github ? 'ready' : ''}`}>{githubIdentity || (health.envConfigured?.github ? 'SERVER KEY' : connectors.githubToken ? 'SESSION KEY' : 'ADD KEY')}</span></div><label className="settings-field-inline"><span>GitHub token <small>used for testing or server save</small></span><input type="password" autoComplete="new-password" value={connectors.githubToken} onChange={(event) => update('githubToken', event.target.value)} placeholder="github_pat_…" /></label><div className="settings-inline-actions"><button className="soft-button" onClick={onGithubTest} disabled={checkingGithub}>{checkingGithub ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test GitHub</button><span>Fine-grained token: Contents read/write, Actions read/write, Metadata read.</span></div>
+        <details className="server-secret-details"><summary>Save a fresh token in Render environment</summary><p>Stores the token as the private GITHUB_TOKEN environment variable on this StackPilot service. The app restarts after saving. Never use an exposed or revoked token here.</p><label className="settings-field-inline"><span>Token expiry date <small>manual reminder</small></span><input type="date" value={serverExpiry} onChange={(event) => setServerExpiry(event.target.value)} /></label><button className="primary-button save-server-token" onClick={saveServerToken} disabled={savingServerToken || !connectors.githubToken}>{savingServerToken ? <Loader2 size={14} className="spin" /> : <LockKeyhole size={14} />} Save token securely to Render</button></details>
       </div>
-      <div className="settings-card"><div className="settings-section-heading"><span className="card-title-icon green"><Cloud size={15} /></span><div><strong>Render</strong><small>Create services after checks, then watch live build logs.</small></div><span className={`settings-state ${connectors.renderToken || health.envConfigured?.render ? 'ready' : ''}`}>{health.envConfigured?.render ? 'SERVER KEY' : connectors.renderToken ? 'SESSION KEY' : 'ADD KEY'}</span></div><label className="settings-field-inline"><span>Render API key</span><input type="password" autoComplete="new-password" value={connectors.renderToken} onChange={(event) => update('renderToken', event.target.value)} placeholder="rnd_…" /></label><label className="settings-field-inline"><span>Render workspace / owner ID</span><input value={connectors.renderOwnerId} onChange={(event) => update('renderOwnerId', event.target.value)} placeholder="tea-…" /></label><div className="settings-inline-actions"><button className="soft-button" onClick={onRenderTest} disabled={checkingRender}>{checkingRender ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test Render</button><span>Service region defaults to Frankfurt; choose per project.</span></div></div>
+      <div className="settings-card"><div className="settings-section-heading"><span className="card-title-icon green"><Cloud size={15} /></span><div><strong>Render workspace fallback</strong><small>Project-level Render keys take priority. Use this only as an optional fallback or to manage StackPilot’s own secrets.</small></div><span className={`settings-state ${connectors.renderToken || health.envConfigured?.render ? 'ready' : ''}`}>{health.envConfigured?.render ? 'SERVER KEY' : connectors.renderToken ? 'SESSION KEY' : 'ADD KEY'}</span></div><label className="settings-field-inline"><span>Workspace fallback API key</span><input type="password" autoComplete="new-password" value={connectors.renderToken} onChange={(event) => update('renderToken', event.target.value)} placeholder="rnd_…" /></label><label className="settings-field-inline"><span>Render workspace / owner ID</span><input value={connectors.renderOwnerId} onChange={(event) => update('renderOwnerId', event.target.value)} placeholder="tea-…" /></label><div className="settings-inline-actions"><button className="soft-button" onClick={onRenderTest} disabled={checkingRender}>{checkingRender ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Test Render</button><span>Service region defaults to Frankfurt; choose per project.</span></div></div>
       <div className="settings-card notification-settings"><div className="settings-section-heading"><span className="card-title-icon amber"><Bell size={15} /></span><div><strong>Real notifications</strong><small>{health.notificationsConfigured ? 'Web Push is configured on the server.' : 'Notifications need browser permission and server VAPID keys.'}</small></div><span className={`settings-state ${notificationReady ? 'ready' : ''}`}>{notificationReady ? 'ON' : 'DEVICE'}</span></div><button className="soft-button" onClick={notificationReady ? onDisableNotifications : onEnableNotifications}><Bell size={14} />{notificationReady ? 'Disable notifications' : 'Enable notifications'}</button><p className="field-help">On iPhone, add StackPilot to Home Screen first, then allow notifications. Web Push is supported by iOS 16.4+ home-screen web apps.</p></div>
-      <div className="privacy-note"><ShieldCheck size={15} /><span>Session keys are kept in this browser tab. Server environment keys are stored by Render. Project environment values are session-only until sent to Render.</span></div>
+      <div className="privacy-note"><ShieldCheck size={15} /><span>Unsaved credentials stay in page memory only and clear on refresh; they are not encrypted in the browser and could be inspected from an unlocked tab. Render stores saved environment secrets server-side. Project runtime values are sent to that project’s Render service only when you save them.</span></div>
     </div>
-    <div className="modal-footer"><button className="quiet-button danger-text" onClick={() => { setConnectors((current) => ({ ...current, githubToken: '', renderToken: '', openRouterKey1: '', openRouterKey2: '' })); }}>Clear session keys</button><div><button className="soft-button" onClick={onClose}>Close</button><button className="primary-button" onClick={onSave}><Check size={15} /> Save session settings</button></div></div>
+    <div className="modal-footer"><button className="quiet-button danger-text" onClick={onClearSecrets}>Clear in-memory keys</button><div><button className="soft-button" onClick={onClose}>Close</button><button className="primary-button" onClick={onSave}><Check size={15} /> Done</button></div></div>
   </section></div>;
 }
 

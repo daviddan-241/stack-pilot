@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { timingSafeEqual, randomUUID } from 'node:crypto';
+import { timingSafeEqual, randomUUID, createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import AdmZip from 'adm-zip';
@@ -53,6 +53,33 @@ function safeEqual(a, b) {
 
 function configuredAppSecret() { return process.env.APP_PIN || process.env.APP_PASSWORD || ''; }
 
+const PROJECT_CREDENTIAL_ENV_FIELDS = {
+  githubToken: 'GITHUB_TOKEN',
+  renderToken: 'RENDER_API_TOKEN',
+  openRouterKey1: 'OPENROUTER_API_KEY_1',
+  openRouterKey2: 'OPENROUTER_API_KEY_2',
+  renderOwnerId: 'RENDER_OWNER_ID',
+};
+function normalizeProjectId(value) {
+  const projectId = String(value || '').trim();
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(projectId)) throw httpError('A valid project ID is required.');
+  return projectId;
+}
+function projectCredentialEnvKey(projectId, field) {
+  const suffix = PROJECT_CREDENTIAL_ENV_FIELDS[field];
+  if (!suffix) throw httpError('Unsupported project credential field.');
+  const idHash = createHash('sha256').update(normalizeProjectId(projectId)).digest('hex').slice(0, 20).toUpperCase();
+  return `STACKPILOT_PROJECT_${idHash}_${suffix}`;
+}
+function readProjectCredentials(projectId) {
+  const values = {};
+  for (const field of Object.keys(PROJECT_CREDENTIAL_ENV_FIELDS)) values[field] = process.env[projectCredentialEnvKey(projectId, field)] || '';
+  return values;
+}
+function projectCredentialStatus(projectId) {
+  return Object.fromEntries(Object.keys(PROJECT_CREDENTIAL_ENV_FIELDS).map((field) => [field, Boolean(process.env[projectCredentialEnvKey(projectId, field)])]));
+}
+
 // Rate-limit failed PIN/password attempts in-process. Render restarts can clear
 // this map; a short PIN is still weaker than a long passphrase.
 app.use('/api', (req, res, next) => {
@@ -67,11 +94,13 @@ app.use('/api', (req, res, next) => {
     current.attempts += 1;
     if (current.attempts >= 8) current.blockedUntil = now + 10 * 60 * 1000;
     authFailures.set(client, current);
-    return res.status(current.blockedUntil ? 429 : 401).json({ error: current.blockedUntil ? 'Too many incorrect workspace codes. Wait ten minutes and try again.' : 'Workspace locked. Enter the app code in Settings.' });
+    return res.status(current.blockedUntil ? 429 : 401).json({ error: current.blockedUntil ? 'Too many incorrect workspace codes. Wait ten minutes and try again.' : 'Workspace locked. Enter the passcode on the lock screen.' });
   }
   authFailures.delete(client);
   next();
 });
+
+app.post('/api/auth/check', (_req, res) => res.json({ ok: true }));
 
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -79,7 +108,7 @@ app.get('/api/health', (_req, res) => {
     authRequired: Boolean(configuredAppSecret()),
     appPinRequired: Boolean(process.env.APP_PIN),
     mode: process.env.NODE_ENV === 'production' ? 'cloud' : 'development',
-    persistence: 'browser-local-and-github-actions',
+    persistence: 'project-indexeddb-and-github-actions',
     envConfigured: {
       github: Boolean(process.env.GITHUB_TOKEN),
       render: Boolean(process.env.RENDER_API_TOKEN),
@@ -489,7 +518,7 @@ app.post('/api/openrouter/test', async (req, res, next) => {
 app.post('/api/github/me', async (req, res, next) => {
   try {
     const token = req.body?.token || process.env.GITHUB_TOKEN;
-    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
+    if (!token) throw httpError('Add a GitHub token in Settings or configure GITHUB_TOKEN on the StackPilot server.');
     const { data } = await githubRequest(token, '/user');
     res.json({ login: data.login, avatarUrl: data.avatar_url, htmlUrl: data.html_url });
   } catch (error) { next(error); }
@@ -550,7 +579,7 @@ app.post('/api/github/push', async (req, res, next) => {
   try {
     const { repository, branch, files: rawFiles, createIfMissing = true, isPrivate = true } = req.body || {};
     const token = req.body?.token || process.env.GITHUB_TOKEN;
-    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
+    if (!token) throw httpError('Add a GitHub token in Settings or configure GITHUB_TOKEN on the StackPilot server.');
     const { owner, repo } = parseGithubRepo(repository);
     const files = normalizeFiles(rawFiles);
     if (Object.values(files).some((content) => !isBinaryAsset(content) && containsPossibleSecret(content))) throw httpError('A project file appears to contain a live credential. Remove or rotate it before pushing to GitHub.');
@@ -652,8 +681,9 @@ app.post('/api/github/push', async (req, res, next) => {
 app.post('/api/github/dispatch', async (req, res, next) => {
   try {
     const { repository, branch, command } = req.body || {};
-    const token = req.body?.token || process.env.GITHUB_TOKEN;
-    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
+    const projectToken = req.body?.projectId ? readProjectCredentials(req.body.projectId).githubToken : '';
+    const token = req.body?.token || projectToken || process.env.GITHUB_TOKEN;
+    if (!token) throw httpError('Add a GitHub token in Settings or configure GITHUB_TOKEN on the StackPilot server.');
     const { owner, repo } = parseGithubRepo(repository);
     const shellCommand = String(command || '').trim();
     if (!shellCommand) throw httpError('Enter a command to run.');
@@ -688,8 +718,9 @@ async function readGithubRunLogs(token, owner, repo, runId) {
 app.post('/api/github/runs', async (req, res, next) => {
   try {
     const { repository, branch, since } = req.body || {};
-    const token = req.body?.token || process.env.GITHUB_TOKEN;
-    if (!token) throw httpError('Add a GitHub token in Connectors or configure GITHUB_TOKEN on the server.');
+    const projectToken = req.body?.projectId ? readProjectCredentials(req.body.projectId).githubToken : '';
+    const token = req.body?.token || projectToken || process.env.GITHUB_TOKEN;
+    if (!token) throw httpError('Add a GitHub token in Settings or configure GITHUB_TOKEN on the StackPilot server.');
     const { owner, repo } = parseGithubRepo(repository);
     const params = new URLSearchParams({ per_page: '15' });
     if (branch) params.set('branch', branch);
@@ -711,11 +742,13 @@ app.post('/api/github/runs', async (req, res, next) => {
 
 function normalizeRenderEnvVars(envVars, { protectOwnService = false } = {}) {
   if (!Array.isArray(envVars) || envVars.length > 30) throw httpError('Supply up to 30 environment variables.');
-  const reserved = protectOwnService ? ['PORT', 'APP_PASSWORD', 'APP_PIN', 'RENDER_API_TOKEN', 'GITHUB_TOKEN', 'GITHUB_TOKEN_EXPIRES_AT', 'OPENROUTER_API_KEY_1', 'OPENROUTER_API_KEY_2', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY', 'STACKPILOT_SERVICE_ID'] : ['PORT'];
+  const reserved = new Set(['PORT', 'GITHUB_TOKEN', 'RENDER_API_TOKEN', 'OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_1', 'OPENROUTER_API_KEY_2', 'VAPID_PRIVATE_KEY', 'VAPID_PUBLIC_KEY', 'STACKPILOT_SERVICE_ID']);
+  if (protectOwnService) ['APP_PASSWORD', 'APP_PIN', 'GITHUB_TOKEN_EXPIRES_AT', 'OPENROUTER_MODEL'].forEach((key) => reserved.add(key));
   const output = envVars.map((item) => ({ key: String(item?.key || '').trim(), value: String(item?.value ?? '') })).filter((item) => item.key);
   for (const item of output) {
     if (!/^[A-Z_][A-Z0-9_]{0,99}$/.test(item.key)) throw httpError(`Invalid environment variable name: ${item.key}`);
-    if (reserved.includes(item.key)) throw httpError(`${item.key} is reserved by Render or StackPilot.`);
+    if (item.key === 'PORT') throw httpError('PORT is reserved by Render.');
+    if (reserved.has(item.key) || item.key.startsWith('STACKPILOT_PROJECT_')) throw httpError(`${item.key} is reserved for StackPilot's server-side platform keys. Use the project platform-key card instead.`);
     if (item.value.length > 2000) throw httpError(`${item.key} exceeds the 2,000 character limit.`);
   }
   return output;
@@ -743,7 +776,7 @@ async function renderRequest(token, endpoint, options = {}) {
 app.post('/api/render/test', async (req, res, next) => {
   try {
     const token = req.body?.token || process.env.RENDER_API_TOKEN;
-    if (!token) throw httpError('Add a Render API key in Connectors or configure RENDER_API_TOKEN on the server.');
+    if (!token) throw httpError('Add a Render API key in Settings or configure RENDER_API_TOKEN on the StackPilot server.');
     const data = await renderRequest(token, '/services?limit=1');
     res.json({ ok: true, message: 'Render API key accepted.', visibleServices: Array.isArray(data) ? data.length : 0 });
   } catch (error) { next(error); }
@@ -768,8 +801,8 @@ app.post('/api/render/create', async (req, res, next) => {
     } = req.body || {};
     const ownerId = req.body?.ownerId || process.env.RENDER_OWNER_ID;
     const token = req.body?.token || process.env.RENDER_API_TOKEN;
-    if (!token) throw httpError('Add a Render API key in Connectors or configure RENDER_API_TOKEN on the server.');
-    if (!ownerId) throw httpError('Enter the Render workspace/owner ID in Connectors.');
+    if (!token) throw httpError('Add a Render API key in Settings or configure RENDER_API_TOKEN on the StackPilot server.');
+    if (!ownerId) throw httpError('Enter the Render workspace/owner ID in Settings.');
     const { owner, repo } = parseGithubRepo(repository);
     const repoUrl = `https://github.com/${owner}/${repo}`;
     const serviceName = String(name || repo).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 55) || 'stackpilot-app';
@@ -1044,7 +1077,7 @@ app.post('/api/settings/github-token', async (req, res, next) => {
     const serviceId = process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || req.body?.serviceId;
     const expiresAt = String(req.body?.expiresAt || '').trim();
     if (!githubToken) throw httpError('Enter the new GitHub token.');
-    if (!renderToken) throw httpError('Add a Render API key in Connectors to save a token to the server environment.');
+    if (!renderToken) throw httpError('Add a Render API key in Settings to save a token to the server environment.');
     if (!serviceId) throw httpError('The StackPilot Render service ID is not configured.');
     if (expiresAt && !/^\d{4}-\d{2}-\d{2}$/.test(expiresAt)) throw httpError('Token expiry must use the YYYY-MM-DD date format.');
     const { data: user } = await githubRequest(githubToken, '/user');
@@ -1085,6 +1118,47 @@ app.post('/api/settings/app-pin', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/projects/:projectId/credentials', (req, res, next) => {
+  try {
+    const projectId = normalizeProjectId(req.params.projectId);
+    res.json({ configured: projectCredentialStatus(projectId) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/projects/:projectId/credentials', async (req, res, next) => {
+  try {
+    const projectId = normalizeProjectId(req.params.projectId);
+    const supplied = req.body?.credentials && typeof req.body.credentials === 'object' && !Array.isArray(req.body.credentials) ? req.body.credentials : {};
+    const current = readProjectCredentials(projectId);
+    const clear = req.body?.clear === true;
+    const updates = clear
+      ? Object.keys(PROJECT_CREDENTIAL_ENV_FIELDS).map((field) => [field, ''])
+      : Object.entries(supplied).filter(([field]) => Object.hasOwn(PROJECT_CREDENTIAL_ENV_FIELDS, field)).map(([field, value]) => [field, String(value ?? '').trim()]).filter(([, value]) => value.length > 0);
+    if (!updates.length) throw httpError('Enter at least one project-specific key before saving.');
+    for (const [field, value] of updates) {
+      if (value.length > 2000) throw httpError(`${field} exceeds the 2,000 character limit.`);
+    }
+
+    const renderToken = String(req.body?.adminRenderToken || supplied.renderToken || process.env.RENDER_API_TOKEN || current.renderToken || '').trim();
+    const serviceId = process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || '';
+    if (!renderToken || !serviceId) throw httpError('Saving per-project platform keys needs a Render API key with access to the StackPilot service and its service ID.');
+
+    const updateMap = new Map(updates);
+    if (updateMap.get('githubToken')) await githubRequest(updateMap.get('githubToken'), '/user');
+    const openRouterKeys = ['openRouterKey1', 'openRouterKey2'].map((field) => updateMap.get(field)).filter(Boolean);
+    if (openRouterKeys.length) await internalPost('/api/openrouter/test', { apiKeys: openRouterKeys });
+    if (updateMap.get('renderToken')) await renderRequest(updateMap.get('renderToken'), '/services?limit=1');
+
+    await Promise.all(updates.map(([field, value]) => {
+      const envKey = projectCredentialEnvKey(projectId, field);
+      return renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/env-vars/${encodeURIComponent(envKey)}`, { method: 'PUT', body: JSON.stringify({ value }) });
+    }));
+    for (const [field, value] of updates) process.env[projectCredentialEnvKey(projectId, field)] = value;
+    const deploy = await renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/deploys`, { method: 'POST', body: JSON.stringify({ clearCache: 'do_not_clear' }) });
+    res.json({ ok: true, configured: projectCredentialStatus(projectId), deployId: deploy.id || '', message: clear ? 'Project-specific keys were cleared from Render.' : 'Project-specific keys were saved as StackPilot Render environment secrets.' });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/jobs', async (req, res, next) => {
   try {
     const input = req.body || {};
@@ -1094,19 +1168,21 @@ app.post('/api/jobs', async (req, res, next) => {
     if (!projectId) throw httpError('A project ID is required to start a background run.');
     if ([...backgroundJobs.values()].some((job) => ['queued', 'running'].includes(job.status))) throw httpError('Another StackPilot background run is already active. Wait for it to finish first.', 409);
     if (!String(project.repo || '').trim()) throw httpError('Enter the GitHub repository (owner/repo) first.');
+    const projectCredentials = readProjectCredentials(projectId);
     const credentials = {
       openRouterKeys: normalizeOpenRouterKeys([
         input.credentials?.openRouterKey1, input.credentials?.openRouterKey2,
+        projectCredentials.openRouterKey1, projectCredentials.openRouterKey2,
         process.env.OPENROUTER_API_KEY_1, process.env.OPENROUTER_API_KEY_2, process.env.OPENROUTER_API_KEY,
       ]),
-      githubToken: String(input.credentials?.githubToken || process.env.GITHUB_TOKEN || ''),
-      renderToken: String(input.credentials?.renderToken || process.env.RENDER_API_TOKEN || ''),
+      githubToken: String(input.credentials?.githubToken || projectCredentials.githubToken || process.env.GITHUB_TOKEN || ''),
+      renderToken: String(input.credentials?.renderToken || projectCredentials.renderToken || process.env.RENDER_API_TOKEN || ''),
     };
-    if (!credentials.githubToken) throw httpError('Add a GitHub token in Settings or configure GITHUB_TOKEN on the server.');
+    if (!credentials.githubToken) throw httpError('Add a GitHub token override in this project’s Deploy & Render tab or configure GITHUB_TOKEN on the StackPilot server.');
     const rawInput = typeof project.rawInput === 'string' ? project.rawInput : '';
     const sourceFiles = project.files && typeof project.files === 'object' ? project.files : {};
     if (!rawInput.trim() && !Object.keys(sourceFiles).length) throw httpError('Paste a code dump, import a ZIP, or add project files before starting.');
-    if (rawInput.trim() && !credentials.openRouterKeys.length) throw httpError('Add one or two OpenRouter keys in Settings to organize a pasted brief or code dump.');
+    if (rawInput.trim() && !credentials.openRouterKeys.length) throw httpError('Add an OpenRouter key override in this project’s Deploy & Render tab or configure a workspace key in Settings.');
     if (rawInput.length > 40_000) throw httpError('Keep the brief or code dump under 40,000 characters for the free-model context budget.');
     const jobId = randomUUID();
     const job = {
@@ -1130,7 +1206,7 @@ app.post('/api/jobs', async (req, res, next) => {
         summary: String(project.summary || ''), stack: String(project.stack || ''), autoDeploy: Boolean(project.autoDeploy),
         envVars: Array.isArray(input.envVars) ? input.envVars : [],
       },
-      ownerId: String(input.renderOwnerId || process.env.RENDER_OWNER_ID || ''), model: normalizeFreeModel(input.model || process.env.OPENROUTER_MODEL),
+      ownerId: String(input.credentials?.renderOwnerId || projectCredentials.renderOwnerId || input.renderOwnerId || process.env.RENDER_OWNER_ID || ''), model: normalizeFreeModel(input.model || process.env.OPENROUTER_MODEL),
     };
     runBackgroundJob(job, context).catch((error) => console.error('[job] unhandled failure', error.message));
     res.status(202).json({ jobId, status: job.status, projectId, message: 'Background run started.' });
@@ -1169,7 +1245,7 @@ async function runBackgroundJob(job, ctx) {
       appendJobLog(job, `Preflight inspected ${preflight.files} files · ${preflight.findings.length} finding(s).`, preflight.ok ? 'success' : 'warning', 'Safety & build guard');
       preflight.findings.forEach((finding) => appendJobLog(job, finding.message, finding.severity === 'error' ? 'error' : 'warning', 'Preflight'));
       if (preflight.ok) { job.steps.preflight = 'done'; break; }
-      if (!creds.openRouterKeys.length || repairs >= 2) throw new Error('Preflight found blocking issues. Add an OpenRouter key in Settings or fix the files before retrying.');
+      if (!creds.openRouterKeys.length || repairs >= 2) throw new Error('Preflight found blocking issues. Add an OpenRouter key in project settings or fix the files before retrying.');
       const repair = await internalPost('/api/repair', { files, errors: preflight.findings.map((finding) => finding.message).join('\n'), apiKeys: creds.openRouterKeys, model: ctx.model });
       files = { ...files, ...(repair.files || {}) };
       repairs += 1;

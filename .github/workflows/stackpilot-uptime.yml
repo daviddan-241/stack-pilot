@@ -1,0 +1,42 @@
+name: StackPilot uptime check
+on:
+  schedule:
+    - cron: '29 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: Probe the public health endpoint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check production health and record a real response
+        env:
+          HEALTH_URL: https://stack-pilot-builder.onrender.com/health
+        shell: bash
+        run: |
+          response_file="$(mktemp)"
+          start_ms="$(date +%s%3N)"
+          set +e
+          http_code="$(curl --silent --show-error --location \
+            --connect-timeout 20 --max-time 90 \
+            --retry 1 --retry-delay 5 --retry-all-errors \
+            --fail-with-body --output "$response_file" \
+            --write-out '%{http_code}' "$HEALTH_URL")"
+          curl_exit=$?
+          set -e
+          end_ms="$(date +%s%3N)"
+          duration_ms=$((end_ms - start_ms))
+
+          printf 'URL: %s\nHTTP status: %s\nCurl exit: %s\nElapsed: %s ms\nResponse body:\n' \
+            "$HEALTH_URL" "${http_code:-000}" "$curl_exit" "$duration_ms"
+          cat "$response_file"
+          printf '\n'
+          rm -f "$response_file"
+
+          if [ "$curl_exit" -ne 0 ] || [ "$http_code" != "200" ]; then
+            echo 'Health probe failed.'
+            exit 1
+          fi
+          echo 'Health probe passed.'

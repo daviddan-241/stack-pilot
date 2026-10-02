@@ -59,3 +59,29 @@ export async function extractProjectZip(file) {
   if (!Object.keys(files).length) throw new Error('No safe text source files were found in that ZIP. Binary files and generated folders are skipped.');
   return { files, skipped, count: Object.keys(files).length, totalBytes };
 }
+
+export async function extractProjectZips(fileList) {
+  const archives = Array.from(fileList || []);
+  if (!archives.length) throw new Error('Choose at least one ZIP archive.');
+  if (archives.length > 100) throw new Error('Choose no more than 100 ZIP archives at a time.');
+  const compressedBytes = archives.reduce((sum, file) => sum + (Number(file?.size) || 0), 0);
+  if (compressedBytes > 25 * 1024 * 1024) throw new Error('The selected ZIP archives exceed the 25 MB combined upload limit.');
+
+  const files = {};
+  let skipped = 0;
+  let extractedBytes = 0;
+  for (const archive of archives) {
+    const result = await extractProjectZip(archive);
+    extractedBytes += result.totalBytes;
+    if (extractedBytes > MAX_TOTAL_PROJECT_BYTES) {
+      throw new Error('Combined ZIP contents exceed the 3 MB project limit. Remove generated files or split the import into smaller projects.');
+    }
+    skipped += result.skipped;
+    Object.assign(files, result.files);
+    if (Object.keys(files).length > MAX_FILE_COUNT) {
+      throw new Error(`Combined ZIP archives exceed the ${MAX_FILE_COUNT} supported file limit.`);
+    }
+  }
+  if (!Object.keys(files).length) throw new Error('No safe project files were found in those ZIP archives.');
+  return { files, skipped, count: Object.keys(files).length, totalBytes: extractedBytes, archiveCount: archives.length };
+}
