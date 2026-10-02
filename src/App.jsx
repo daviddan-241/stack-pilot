@@ -213,19 +213,26 @@ function App() {
     } finally { checkingMonitors.current.delete(id); }
   }, [api, showToast]);
 
-  const addMonitor = (value, name = '') => {
+  const addMonitor = (value, name = '', projectId = '') => {
     let url;
     try { url = normalizeMonitorUrl(value); }
     catch (error) { showToast(error.message || 'Enter a public HTTP(S) URL.', 'error'); return; }
-    if (monitorsRef.current.some((item) => item.url === url)) { showToast('That URL is already being monitored.'); return; }
+    let duplicate = monitorsRef.current.find((item) => item.url === url && (projectId ? item.projectId === projectId || item.id === `project_${projectId}` : !item.projectId));
+    if (!duplicate && projectId) duplicate = monitorsRef.current.find((item) => item.url === url && !item.projectId);
+    if (duplicate) {
+      if (projectId && duplicate.projectId !== projectId) setMonitors((rows) => rows.map((item) => item.id === duplicate.id ? { ...item, projectId, name: name.trim() || item.name } : item));
+      showToast(projectId ? 'This URL is already monitored for this project.' : 'That URL is already being monitored.');
+      return;
+    }
     if (monitorsRef.current.length >= 30) { showToast('Keep at most 30 monitor URLs on this device.', 'error'); return; }
-    const monitor = { id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, name: name.trim() || new URL(url).hostname, url, intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' };
+    const monitor = { id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, projectId: projectId || '', name: name.trim() || new URL(url).hostname, url, intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' };
     setMonitors((rows) => [monitor, ...rows]);
     window.setTimeout(() => pingMonitor(monitor.id), 50);
     showToast('Monitor added. Checks run while this app is open and visible.', 'success');
   };
 
   const removeMonitor = (id) => setMonitors((rows) => rows.filter((item) => item.id !== id));
+  const updateMonitorInterval = (id, intervalSec) => setMonitors((rows) => rows.map((item) => item.id === id ? { ...item, intervalSec: Number(intervalSec) } : item));
 
   useEffect(() => { monitorsRef.current = monitors; try { localStorage.setItem('stackpilot.uptime.monitors', JSON.stringify(monitors)); } catch { /* local storage may be disabled */ } }, [monitors]);
 
@@ -248,14 +255,35 @@ function App() {
   }, [pingMonitor, connectors.appPassword, health.authRequired]);
 
   useEffect(() => {
-    const discovered = projects.filter((project) => project.renderUrl).map((project) => ({ project, url: project.renderUrl }));
+    const discovered = projects.filter((project) => project.renderUrl).map((project) => {
+      try { return { project, url: normalizeMonitorUrl(project.renderUrl) }; } catch { return null; }
+    }).filter(Boolean);
     if (!discovered.length) return;
     setMonitors((rows) => {
-      const known = new Set(rows.map((item) => item.url));
-      const additions = discovered.filter((item) => {
-        try { return !known.has(normalizeMonitorUrl(item.url)); } catch { return false; }
-      }).map(({ project, url }) => ({ id: `project_${project.id}`, name: project.name, url: normalizeMonitorUrl(url), intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' }));
-      return additions.length ? [...additions, ...rows].slice(0, 30) : rows;
+      const next = [...rows];
+      let changed = false;
+      for (const { project, url } of discovered) {
+        const projectIndex = next.findIndex((item) => item.projectId === project.id || item.id === `project_${project.id}`);
+        if (projectIndex >= 0) {
+          const prior = next[projectIndex];
+          if (prior.url !== url || prior.name !== project.name || prior.projectId !== project.id) {
+            next[projectIndex] = { ...prior, projectId: project.id, name: project.name, url, status: prior.url === url ? prior.status : 'unknown', checks: prior.url === url ? prior.checks : [], lastCheckedAt: prior.url === url ? prior.lastCheckedAt : '' };
+            changed = true;
+          }
+          continue;
+        }
+        const urlIndex = next.findIndex((item) => item.url === url && !item.projectId);
+        if (urlIndex >= 0) {
+          next[urlIndex] = { ...next[urlIndex], projectId: project.id, name: project.name };
+          changed = true;
+          continue;
+        }
+        if (next.length < 30) {
+          next.unshift({ id: `project_${project.id}`, projectId: project.id, name: project.name, url, intervalSec: 60, checks: [], addedAt: new Date().toISOString(), status: 'unknown' });
+          changed = true;
+        }
+      }
+      return changed ? next : rows;
     });
   }, [projects]);
 
@@ -590,6 +618,7 @@ function App() {
     try { sessionStorage.removeItem(`${PROJECT_VAULT_PREFIX}${id}`); sessionStorage.removeItem(`${PROJECT_ENV_PREFIX}${id}`); } catch { /* ignore */ }
     const next = projects.filter((row) => row.id !== id);
     setProjects(next);
+    setMonitors((rows) => rows.filter((item) => item.projectId !== id && item.id !== `project_${id}`));
     if (activeId === id) { setActiveId(''); setPage('start'); }
     showToast('Project removed from this browser. GitHub and Render were not changed.');
   };
@@ -718,7 +747,7 @@ function App() {
         sourceMode={startSourceMode} setSourceMode={setStartSourceMode} importingGithub={importingGithub} onImportGithub={importGithubRepo}
         repo={startRepo} setRepo={setStartRepo} branch={startBranch} setBranch={setStartBranch} name={startName} setName={setStartName}
         autoDeploy={startAutoDeploy} setAutoDeploy={setStartAutoDeploy} onStart={newProjectFromHome} onOpenMonitors={() => setPage('monitor')}
-        projects={filteredProjects} onOpen={openProject} onNew={createNewProject} onDelete={deleteProject}
+        projects={filteredProjects} monitors={monitors} onOpen={openProject} onNew={createNewProject} onDelete={deleteProject}
         search={search} setSearch={setSearch} onSettings={() => setSettingsOpen(true)} onAbout={() => setPage('about')}
         health={health} connectorCount={connectorCount} notificationsReady={notificationReady} onEnableNotifications={enableNotifications}
         onSample={() => { setStartInput(SAMPLE_DUMP); if (!startName) setStartName('Northstar landing page'); }}
@@ -728,7 +757,8 @@ function App() {
         project={active} credentials={effectiveCredentials(active.id)} envConfigured={health.envConfigured || {}}
         projectVault={activeVault} onVaultChange={(key, value) => setVaultField(active.id, key, value)}
         envRows={projectEnv} onEnvChange={updateEnvironment} onAddEnv={addEnvironment} onRemoveEnv={removeEnvironment}
-        tab={workspaceTab} setTab={setWorkspaceTab} onHome={() => setPage('start')} onSettings={() => setSettingsOpen(true)}
+        tab={workspaceTab} setTab={setWorkspaceTab} onHome={() => setPage('start')} allProjects={projects} onOpenProject={openProject}
+        monitors={monitors} onAddMonitor={addMonitor} onPingMonitor={pingMonitor} onRemoveMonitor={removeMonitor} onMonitorInterval={updateMonitorInterval} onSettings={() => setSettingsOpen(true)}
         onNameChange={updateProjectName} onRepoChange={updateRepo} onProjectChange={(patch) => updateProject(active.id, patch)} onRun={runOrDeploy} onToggleAutoDeploy={toggleAutoDeploy}
         busy={appBusy} onDelete={() => deleteProject(active.id)} onEditorChange={(value) => { setEditorDraft(value); setEditorDirty(true); }}
         editorDraft={editorDraft} editorDirty={editorDirty} onSaveEditor={saveEditor} onSelectFile={selectFile} onAddFile={addFile}
@@ -753,8 +783,13 @@ function App() {
   );
 }
 
-function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onZipUpload, sourceMode, setSourceMode, importingGithub, onImportGithub, repo, setRepo, branch, setBranch, name, setName, autoDeploy, setAutoDeploy, onStart, projects, onOpen, onNew, onDelete, search, setSearch, onSettings, onAbout, onOpenMonitors, health, connectorCount, notificationsReady, onEnableNotifications, onSample, onInstallHelp, onCopyMonitor }) {
+function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onZipUpload, sourceMode, setSourceMode, importingGithub, onImportGithub, repo, setRepo, branch, setBranch, name, setName, autoDeploy, setAutoDeploy, onStart, projects, monitors = [], onOpen, onNew, onDelete, search, setSearch, onSettings, onAbout, onOpenMonitors, health, connectorCount, notificationsReady, onEnableNotifications, onSample, onInstallHelp, onCopyMonitor }) {
+  const [projectFilter, setProjectFilter] = useState('all');
   const running = projects.filter((project) => ['queued', 'running', 'deploying'].includes(project.status));
+  const liveProjects = projects.filter((project) => project.status === 'live' || project.renderUrl);
+  const draftProjects = projects.filter((project) => ['draft', 'ready'].includes(project.status));
+  const shelfProjects = projectFilter === 'recent' ? projects.slice(0, 6) : projectFilter === 'live' ? liveProjects : projectFilter === 'drafts' ? draftProjects : projects;
+  const projectFilters = [{ id: 'all', label: 'All projects', count: projects.length }, { id: 'recent', label: 'Recent', count: Math.min(projects.length, 6) }, { id: 'live', label: 'Live', count: liveProjects.length }, { id: 'drafts', label: 'Drafts', count: draftProjects.length }];
   return <div className="start-page">
     <header className="start-header">
       <button className="brand-lockup" onClick={onNew}><img className="brand-app-icon" src="/stackpilot-icon.png" alt="" /><span><strong>stackpilot</strong><small>AI BUILD STUDIO</small></span></button>
@@ -799,8 +834,12 @@ function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onZipUpl
       {running.length > 0 && <section className="running-strip"><div className="running-strip-icon"><Loader2 size={16} className="spin" /></div><div><strong>{running.length} project{running.length === 1 ? '' : 's'} still working</strong><span>Runs continue on StackPilot while this page is closed.</span></div><button onClick={() => onOpen(running[0].id)}>View live progress <ArrowRight size={14} /></button></section>}
 
       <section className="recent-section">
-        <div className="recent-heading"><div><span className="section-eyebrow">YOUR WORK</span><h2>Recent projects</h2></div><div className="recent-controls"><label className="recent-search"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a project" /></label><button className="new-project-button" onClick={onNew}><Plus size={15} /> New</button></div></div>
-        {projects.length ? <div className="recent-grid">{projects.slice(0, 6).map((project) => <ProjectCard key={project.id} project={project} onOpen={() => onOpen(project.id)} onDelete={() => onDelete(project.id)} />)}</div> : <div className="recent-empty"><div className="empty-mark"><Folder size={19} /></div><div><strong>Your project shelf is ready.</strong><span>Build your first project above. Drafts are saved on this device; GitHub is the durable source.</span></div></div>}
+        <div className="recent-heading"><div><span className="section-eyebrow">YOUR WORK</span><h2>Projects</h2></div><div className="recent-controls"><label className="recent-search"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a project" /></label><button className="new-project-button" onClick={onNew}><Plus size={15} /> New project</button></div></div>
+        <div className="project-shelf-tabs" role="tablist" aria-label="Filter projects">{projectFilters.map((item) => <button key={item.id} role="tab" aria-selected={projectFilter === item.id} className={projectFilter === item.id ? 'selected' : ''} onClick={() => setProjectFilter(item.id)}>{item.label}<span>{item.count}</span></button>)}</div>
+        {projects.length ? shelfProjects.length ? <div className="recent-grid">{shelfProjects.map((project) => {
+          const monitor = monitors.find((item) => item.projectId === project.id || item.id === `project_${project.id}`) || monitors.find((item) => item.url === project.renderUrl && !item.projectId);
+          return <ProjectCard key={project.id} project={project} monitor={monitor} onOpen={() => onOpen(project.id)} onDelete={() => onDelete(project.id)} />;
+        })}</div> : <div className="recent-empty"><div className="empty-mark"><Folder size={19} /></div><div><strong>No projects in this view.</strong><span>Choose another project tab or change your search.</span></div></div> : <div className="recent-empty"><div className="empty-mark"><Folder size={19} /></div><div><strong>Your project shelf is ready.</strong><span>Build your first project above. Drafts are saved on this device; GitHub is the durable source.</span></div></div>}
       </section>
 
       <footer className="start-footer"><span><img src="/stackpilot-icon.png" alt="" /> StackPilot <i /> Five visible steps. One clear live result.</span><div><a href="/health" target="_blank" rel="noreferrer"><Radio size={12} /> uptime check</a><button onClick={onInstallHelp}><Smartphone size={12} /> add to iPhone</button><button onClick={onCopyMonitor}>copy monitor URL</button></div></footer>
@@ -808,27 +847,29 @@ function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onZipUpl
   </div>;
 }
 
-function ProjectCard({ project, onOpen, onDelete }) {
+function ProjectCard({ project, monitor, onOpen, onDelete }) {
+  const uptimeLabel = monitor?.status === 'up' ? 'Up' : monitor?.status === 'down' ? 'Down' : monitor ? 'Waiting' : project.renderUrl ? 'Not checked' : 'No URL';
+  const renderLabel = project.renderUrl ? `Render · ${project.status === 'live' ? 'Live' : statusLabel(project.status)}` : project.renderServiceId ? 'Render service linked' : 'Render not connected';
   return <article className="recent-card">
     <button className="recent-card-open" onClick={onOpen}>
-      <div className="recent-card-top"><span className="recent-card-icon"><Code2 size={17} /></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span></div>
+      <div className="recent-card-top"><span className="recent-card-icon"><Code2 size={20} /></span><span className={`status-pill status-${project.status}`}>{statusLabel(project.status)}</span></div>
       <strong>{project.name}</strong><span className="recent-card-repo">{project.repo || project.stack || 'Workspace draft'}</span>
       {['running', 'queued', 'deploying'].includes(project.status) && <div className="mini-progress"><span style={{ width: `${calculateProgress(project.steps, project.status, project.progress)}%` }} /></div>}
-      <div className="recent-card-bottom"><span><Activity size={12} /> Updated {timeAgo(project.updatedAt)}</span><ArrowUpRight size={14} /></div>
+      <div className="project-card-health"><span className={`project-health-chip ${monitor?.status || 'unknown'}`}><Wifi size={14} />{uptimeLabel}{monitor?.checks?.at(-1)?.durationMs ? ` · ${monitor.checks.at(-1).durationMs} ms` : ''}</span><span className={`project-render-chip ${project.renderUrl ? 'connected' : ''}`}><Cloud size={14} />{renderLabel}</span></div>
+      <div className="recent-card-bottom"><span><Activity size={14} /> Updated {timeAgo(project.updatedAt)}</span><ArrowUpRight size={16} /></div>
     </button>
-    <button className="recent-card-delete" onClick={onDelete} aria-label={`Remove ${project.name}`} title="Remove from this device"><Trash2 size={13} /></button>
+    <button className="recent-card-delete" onClick={onDelete} aria-label={`Remove ${project.name}`} title="Remove from this device"><Trash2 size={15} /></button>
   </article>;
 }
 
-function ProjectWorkspace({ project, credentials, envConfigured, projectVault, onVaultChange, envRows, onEnvChange, onAddEnv, onRemoveEnv, tab, setTab, onHome, onSettings, onNameChange, onRepoChange, onProjectChange, onRun, onToggleAutoDeploy, busy, onDelete, onEditorChange, editorDraft, editorDirty, onSaveEditor, onSelectFile, onAddFile, onAbout, onOpenMonitors, onShowToast, onRefreshEnv, shellCommand, setShellCommand, shellBusy, onRunShell }) {
+function ProjectWorkspace({ project, credentials, envConfigured, projectVault, onVaultChange, envRows, onEnvChange, onAddEnv, onRemoveEnv, tab, setTab, onHome, allProjects = [], onOpenProject, monitors = [], onAddMonitor, onPingMonitor, onRemoveMonitor, onMonitorInterval, onSettings, onNameChange, onRepoChange, onProjectChange, onRun, onToggleAutoDeploy, busy, onDelete, onEditorChange, editorDraft, editorDirty, onSaveEditor, onSelectFile, onAddFile, onAbout, onOpenMonitors, onShowToast, onRefreshEnv, shellCommand, setShellCommand, shellBusy, onRunShell }) {
   const progress = calculateProgress(project.steps, project.status, project.progress);
   const isWorking = ['queued', 'running', 'deploying'].includes(project.status);
   const canDeploy = Boolean(project.renderUrl || project.renderServiceId || credentials.renderToken || envConfigured.render);
-  const activeSteps = Object.values(project.steps || {}).filter((step) => step === 'done').length;
-  const latest = project.logs?.at(-1);
-  const [configOpen, setConfigOpen] = useState(false);
-  const [showEnvValues, setShowEnvValues] = useState(false);
-  const tabs = [{ id: 'build', label: 'Build', icon: Sparkles }, { id: 'files', label: 'Files', icon: Folder }, { id: 'preview', label: 'Live & keys', icon: Eye }];
+  const projectMonitors = monitors.filter((item) => item.projectId === project.id || item.id === `project_${project.id}`);
+  const primaryMonitor = projectMonitors[0] || null;
+  const sideProjects = allProjects.filter((item) => item.id !== project.id).slice(0, 5);
+  const tabs = [{ id: 'build', label: 'Build', icon: Sparkles }, { id: 'files', label: 'Files', icon: Folder }, { id: 'deploy', label: 'Deploy & Render', icon: Cloud }, { id: 'uptime', label: 'Uptime', icon: Wifi }];
   const deployButtonText = isWorking ? 'Working…' : project.status === 'verified' && !project.autoDeploy ? 'Deploy verified build' : project.status === 'live' ? 'Build & deploy again' : 'Run tests & release';
   const runClick = () => onRun(project.status === 'verified' && !project.autoDeploy);
 
@@ -845,9 +886,16 @@ function ProjectWorkspace({ project, credentials, envConfigured, projectVault, o
         <div className="project-heading-actions"><button className="soft-button" onClick={onHome}><ArrowLeft size={15} /><span>All projects</span></button><button className="icon-only workspace-delete" onClick={onDelete} aria-label="Delete project" title="Delete this project"><Trash2 size={15} /></button><button className="primary-button" onClick={runClick} disabled={busy || (!project.files || !Object.keys(project.files).length) && !project.rawInput?.trim()}>{busy ? <Loader2 size={16} className="spin" /> : <Rocket size={16} />}<span>{deployButtonText}</span></button></div>
       </section>
 
-      <nav className="workspace-tabs" aria-label="Project workspace tabs">{tabs.map(({ id, label, icon: Icon }) => <button key={id} className={tab === id ? 'selected' : ''} onClick={() => setTab(id)}><Icon size={15} /><span>{label}</span>{id === 'files' && <em>{Object.keys(project.files || {}).length}</em>}{id === 'preview' && project.renderUrl && <i />}</button>)}<div className="workspace-tabs-spacer" /><button className="tab-settings" onClick={() => setConfigOpen((value) => !value)}><Settings2 size={15} /><span>Release settings</span></button></nav>
-
-      {isWorking && <ProgressPanel project={project} progress={progress} />}
+      <div className="workspace-shell">
+        <nav className="workspace-tabs" aria-label="Project workspace tabs">
+          <div className="workspace-tabs-heading"><span>PROJECT MENU</span><button onClick={onHome}><ArrowLeft size={14} /> All projects <em>{allProjects.length}</em></button></div>
+          <div className="workspace-tab-links">{tabs.map(({ id, label, icon: Icon }) => <button key={id} className={tab === id ? 'selected' : ''} aria-current={tab === id ? 'page' : undefined} onClick={() => setTab(id)}><Icon size={18} /><span>{label}</span>{id === 'files' && <em>{Object.keys(project.files || {}).length}</em>}{id === 'uptime' && <i className={`sidebar-tab-indicator ${primaryMonitor?.status || 'unknown'}`} />}</button>)}</div>
+          <div className="workspace-sidebar-health"><span className="sidebar-section-label">PROJECT STATUS</span><div className="sidebar-health-row"><span className={`monitor-status-light ${project.renderUrl && project.status === 'live' ? 'up' : project.status === 'failed' ? 'down' : 'unknown'}`} /><span><small>RENDER</small><strong>{project.renderUrl ? statusLabel(project.status) : project.renderServiceId ? 'Service linked' : 'Not connected'}</strong></span></div><div className="sidebar-health-row"><span className={`monitor-status-light ${primaryMonitor?.status || 'unknown'}`} /><span><small>UPTIME</small><strong>{primaryMonitor ? primaryMonitor.status === 'up' ? 'Responding' : primaryMonitor.status === 'down' ? 'Needs attention' : 'Waiting for check' : 'No URL monitored'}</strong></span></div><button className="sidebar-monitor-link" onClick={onOpenMonitors}><Activity size={14} /> All monitors <ArrowUpRight size={13} /></button></div>
+          {sideProjects.length > 0 && <div className="workspace-sidebar-projects"><span className="sidebar-section-label">RECENT PROJECTS</span>{sideProjects.map((item) => <button key={item.id} onClick={() => onOpenProject?.(item.id)}><span className={`project-dot project-${item.status}`} /><span>{item.name}</span></button>)}<button className="sidebar-all-projects" onClick={onHome}>Browse all projects <ArrowRight size={13} /></button></div>}
+          <button className="tab-settings" onClick={onSettings}><Settings2 size={17} /><span>Connections & settings</span></button>
+        </nav>
+        <div className="workspace-tab-content">
+          {isWorking && <ProgressPanel project={project} progress={progress} />}
 
       {tab === 'build' && <div className="build-layout">
         <section className="build-primary-column">
@@ -856,8 +904,6 @@ function ProjectWorkspace({ project, credentials, envConfigured, projectVault, o
             <textarea className="workspace-dump" value={project.rawInput || ''} onChange={(event) => onProjectChange({ rawInput: event.target.value })} placeholder="Paste your code dump or describe the project…" aria-label="Project code and instructions" />
             <div className="dump-footer"><span><LockKeyhole size={12} /> Credentials are never added to the commit</span><button className="small-action" onClick={() => onShowToast('Paste updates from your starter brief; the file editor stays in the Files tab.', 'info')}>How it works <CircleHelp size={13} /></button></div>
           </div>
-
-          {configOpen && <ReleaseSettings project={project} onRepoChange={onRepoChange} onToggleAutoDeploy={onToggleAutoDeploy} onProjectChange={onProjectChange} onSettings={onSettings} />}
 
           {!isWorking && <ProgressPanel project={project} progress={progress} compact />}
 
@@ -876,12 +922,16 @@ function ProjectWorkspace({ project, credentials, envConfigured, projectVault, o
         <section className="workspace-card editor-card"><div className="editor-card-header"><div className="file-name-label"><FileCode2 size={15} /><span>{project.activeFile || 'Choose a file'}</span><em>{project.activeFile ? fileLanguage(project.activeFile) : '—'}</em></div><div className="editor-card-actions">{editorDirty && <span className="unsaved-chip">Unsaved</span>}<button className="small-action" disabled={!editorDraft} onClick={() => navigator.clipboard?.writeText(editorDraft).then(() => onShowToast('File copied.')).catch(() => onShowToast('Copy is unavailable in this browser.', 'error'))}><Copy size={13} /> Copy</button><button className="save-editor-button" disabled={!editorDirty} onClick={onSaveEditor}><Save size={13} /> Save</button></div></div>{project.activeFile ? isBinaryAsset(project.files?.[project.activeFile]) ? <BinaryAssetPreview path={project.activeFile} content={project.files[project.activeFile]} /> : <div className="code-editor-wrap"><div className="line-gutter">{Array.from({ length: Math.max(1, editorDraft.split('\n').length) }, (_, index) => <span key={index}>{index + 1}</span>)}</div><textarea spellCheck="false" className="code-editor" value={editorDraft} onChange={(event) => onEditorChange(event.target.value)} aria-label={`Edit ${project.activeFile}`} /></div> : <div className="editor-empty"><div><Code2 size={24} /></div><strong>Select a file</strong><span>Your editor is ready for quick changes on desktop or iPhone.</span></div>}<div className="editor-bottom"><span>UTF-8 <i /> {project.activeFile ? isBinaryAsset(project.files?.[project.activeFile]) ? `${binaryAssetByteLength(project.files[project.activeFile]).toLocaleString()} bytes` : `${editorDraft.split('\n').length} lines` : 'No file selected'}</span><span>Mobile-friendly editor · binary assets preserved</span></div></section>
       </div>}
 
-      {tab === 'preview' && <div className="preview-layout">
+      {tab === 'deploy' && <div className="preview-layout">
         <section className="workspace-card live-preview-card"><div className="card-header"><div className="card-title-icon green"><Eye size={16} /></div><div><strong>Live browser preview</strong><span>{project.renderUrl ? 'The deployed Render site, embedded here.' : 'A real preview appears as soon as Render finishes a successful deploy.'}</span></div>{project.renderUrl && <a className="small-action" href={project.renderUrl} target="_blank" rel="noreferrer"><ExternalLink size={13} /> Open tab</a>}</div>{project.renderUrl ? <div className="embedded-browser"><div className="browser-chrome"><span /><span /><span /><div className="browser-address"><LockKeyhole size={10} />{project.renderUrl.replace(/^https?:\/\//, '')}</div><button onClick={() => window.open(project.renderUrl, '_blank', 'noopener,noreferrer')} aria-label="Open preview in a new tab"><ArrowUpRight size={13} /></button></div><iframe title={`Live preview of ${project.name}`} src={project.renderUrl} loading="lazy" referrerPolicy="no-referrer" /></div> : <div className="preview-empty"><div className="preview-orb"><Globe size={22} /></div><strong>{project.status === 'verified' ? 'Checks passed. Ready for Render.' : 'Your live preview will appear here.'}</strong><span>{project.status === 'verified' ? 'Turn on auto-deploy or use “Deploy verified build”.' : 'The Render operator only starts after GitHub tests and build succeed.'}</span>{project.status === 'verified' && <button className="primary-button" onClick={runClick} disabled={busy}><Rocket size={15} /> Deploy verified build</button>}</div>}</section>
         <ProjectCredentialsCard vault={projectVault} onChange={onVaultChange} />
         <EnvironmentCard rows={envRows} onChange={onEnvChange} onAdd={onAddEnv} onRemove={onRemoveEnv} onRefresh={onRefreshEnv} serviceId={project.renderServiceId} envConfigured={envConfigured} credentials={credentials} />
         <div className="preview-bottom-grid"><ReleaseSettings project={project} onRepoChange={onRepoChange} onToggleAutoDeploy={onToggleAutoDeploy} onProjectChange={onProjectChange} onSettings={onSettings} /><RenderStatusCard project={project} onSettings={onSettings} /></div>
       </div>}
+
+      {tab === 'uptime' && <ProjectUptimeTab project={project} monitors={projectMonitors} onAdd={onAddMonitor} onPing={onPingMonitor} onRemove={onRemoveMonitor} onInterval={onMonitorInterval} onOpenDeploy={() => setTab('deploy')} onOpenMonitors={onOpenMonitors} />}
+        </div>
+      </div>
     </main>
   </div>;
 }
@@ -1020,6 +1070,30 @@ function monitorStateDuration(monitor) {
   return `${current ? 'Up for ' : 'Down for '}${durationText(since)}`;
 }
 
+function ProjectUptimeTab({ project, monitors, onAdd, onPing, onRemove, onInterval, onOpenDeploy, onOpenMonitors }) {
+  const [url, setUrl] = useState(project.renderUrl || '');
+  const [name, setName] = useState(project.name || '');
+  useEffect(() => { setUrl(project.renderUrl || ''); setName(project.name || ''); }, [project.id, project.renderUrl, project.name]);
+  const add = (event) => { event.preventDefault(); if (!url.trim()) return; onAdd(url, name, project.id); setUrl(project.renderUrl || ''); };
+  const latest = monitors.map((monitor) => monitor.checks?.at(-1)).filter(Boolean).sort((a, b) => Date.parse(b.checkedAt) - Date.parse(a.checkedAt))[0];
+  const responding = monitors.filter((monitor) => monitor.status === 'up').length;
+  return <div className="project-uptime-layout">
+    <section className="project-uptime-heading"><div><span className="section-eyebrow">PROJECT HEALTH</span><h2>Uptime & Render</h2><p>Checks, response history, and deployment status for <strong>{project.name}</strong> stay grouped with this project.</p></div><button className="soft-button" onClick={onOpenMonitors}><Activity size={15} /> All monitors</button></section>
+    <section className="workspace-card project-service-overview"><div className="project-service-main"><span className="card-title-icon green"><Cloud size={18} /></span><div><small>RENDER SERVICE</small><strong>{project.renderUrl ? statusLabel(project.status) : project.renderServiceId ? 'Service linked' : 'Not connected yet'}</strong><span>{project.renderUrl || (project.renderServiceId ? `Service ID ${project.renderServiceId}` : 'Connect a Render service in Deploy & Render after GitHub checks pass.')}</span></div></div><div className="project-service-metrics"><div><span>URL CHECKS</span><strong>{monitors.length}</strong></div><div><span>RESPONDING</span><strong>{responding}</strong></div><div><span>LAST PING</span><strong>{latest ? timeAgo(latest.checkedAt) : 'Not checked'}</strong></div></div><div className="project-service-actions">{project.renderUrl && <a className="soft-button" href={project.renderUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Open live site</a>}<button className="primary-button" onClick={onOpenDeploy}><Settings2 size={15} /> Deploy & Render settings</button></div></section>
+    <form className="monitor-add-card project-monitor-add" onSubmit={add}><div className="monitor-add-title"><span className="card-title-icon blue"><Wifi size={17} /></span><div><strong>Monitor a URL for this project</strong><small>Use the Render URL above or add another public endpoint.</small></div></div><div className="monitor-add-fields"><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://your-project.onrender.com/health" aria-label={`Public URL for ${project.name}`} type="url" required /><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Project or endpoint name" aria-label="Monitor label" /><button className="primary-button" type="submit"><Plus size={16} /> Add URL</button></div><p><ShieldCheck size={13} /> Checks run at your selected interval while StackPilot is open and visible. Private addresses are blocked; use an external monitor for continuous checks.</p></form>
+    <div className="project-monitor-list-heading"><div><span className="section-eyebrow">THIS PROJECT</span><h3>Ping history</h3></div><span>{monitors.length} endpoint{monitors.length === 1 ? '' : 's'}</span></div>
+    <div className="monitor-list">{monitors.map((monitor) => <MonitorCard key={monitor.id} monitor={monitor} onPing={onPing} onRemove={onRemove} onInterval={onInterval} />)}{!monitors.length && <div className="recent-empty"><div className="empty-mark"><Wifi size={19} /></div><div><strong>No uptime check yet</strong><span>Add this project's public URL above. A deployed Render URL is attached automatically.</span></div></div>}</div>
+  </div>;
+}
+
+function MonitorCard({ monitor, onPing, onRemove, onInterval }) {
+  const checks = monitor.checks || [];
+  const recent = checks.slice(-100);
+  const uptime = recent.length ? Math.round(recent.filter((check) => check.ok).length / recent.length * 100) : null;
+  const last = checks.at(-1);
+  return <section className="workspace-card monitor-card" key={monitor.id}><div className="monitor-card-head"><span className={`monitor-status-light ${monitor.status}`} /><div className="monitor-card-title"><strong>{monitor.name}</strong><a href={monitor.url} target="_blank" rel="noreferrer">{monitor.url}<ExternalLink size={14} /></a></div><span className={`monitor-status-chip ${monitor.status}`}>{monitor.checking ? 'CHECKING' : monitor.status === 'up' ? 'UP' : monitor.status === 'down' ? 'DOWN' : 'WAITING'}</span><button className="icon-only danger-icon" onClick={() => onRemove(monitor.id)} aria-label={`Remove ${monitor.name}`} title="Remove monitor"><X size={15} /></button></div><div className="monitor-metrics"><div><span>RESPONSE</span><strong>{last ? `${last.durationMs} ms` : '—'}</strong></div><div><span>HTTP</span><strong>{last?.statusCode || '—'}</strong></div><div><span>UPTIME</span><strong>{uptime === null ? '—' : `${uptime}%`}</strong></div><div><span>STATE DURATION</span><strong>{monitorStateDuration(monitor)}</strong></div></div><div className="monitor-card-actions"><label>Check interval<select value={monitor.intervalSec || 60} onChange={(event) => onInterval(monitor.id, event.target.value)}><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option></select></label><span>{last ? `Last ping ${timeAgo(last.checkedAt)}${last.error ? ` · ${last.error}` : ''}` : 'No checks yet'}</span><button className="soft-button" onClick={() => onPing(monitor.id)} disabled={monitor.checking}><Radio size={15} /> Ping now</button></div><details className="monitor-log-details"><summary><Activity size={15} /> Recent ping log <span>{checks.length}</span><ChevronDown size={14} /></summary><div className="monitor-log-list">{checks.slice(-20).reverse().map((check, index) => <div className="monitor-log-row" key={`${check.checkedAt}_${index}`}><i className={check.ok ? 'ok' : 'bad'} /><time>{timeLabel(check.checkedAt)}</time><span>{check.ok ? 'Responded' : check.error || 'No response'}</span><strong>{check.statusCode || '—'} · {check.durationMs} ms</strong></div>)}</div></details></section>;
+}
+
 function MonitorPage({ monitors, onBack, onAdd, onPing, onRemove, onInterval }) {
   const [url, setUrl] = useState('');
   const [name, setName] = useState('');
@@ -1028,13 +1102,7 @@ function MonitorPage({ monitors, onBack, onAdd, onPing, onRemove, onInterval }) 
   return <div className="about-page monitor-page"><header className="workspace-header"><button className="workspace-brand" onClick={onBack}><img src="/stackpilot-icon.png" alt="" /><span>stackpilot</span></button><div className="workspace-breadcrumb"><button onClick={onBack}>Workspace</button><ChevronRight size={13} /><span>Uptime monitors</span></div><button className="header-link" onClick={onBack}>Back to projects <ArrowLeft size={14} /></button></header><main className="about-main"><button className="back-link" onClick={onBack}><ArrowLeft size={14} /> Back</button><div className="about-heading"><span className="section-eyebrow">LIVE URL CHECKS</span><h1>Know when a site responds.</h1><p>Add any public Render or web URL. StackPilot records status, response time, and recent ping history on this device.</p></div>
     <div className="monitor-stats"><div><strong>{monitors.length}</strong><span>URLs monitored</span></div><div><strong>{totals.up || 0}</strong><span>responding</span></div><div><strong>{totals.down || 0}</strong><span>failing</span></div><div><strong>60s+</strong><span>minimum interval</span></div></div>
     <form className="monitor-add-card" onSubmit={add}><div className="monitor-add-title"><span className="card-title-icon green"><Wifi size={16} /></span><div><strong>Add a public URL</strong><small>Checks do not send cookies or authentication headers.</small></div></div><div className="monitor-add-fields"><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://your-app.onrender.com/health" aria-label="Public URL to monitor" type="url" required /><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Label (optional)" aria-label="Monitor label" /><button className="primary-button" type="submit"><Plus size={15} /> Add monitor</button></div><p><ShieldCheck size={12} /> Local/private network addresses are blocked. Checks run while this app is open and visible; use an external uptime service if you need monitoring with the browser closed.</p></form>
-    <div className="monitor-list">{monitors.map((monitor) => {
-      const checks = monitor.checks || [];
-      const recent = checks.slice(-100);
-      const uptime = recent.length ? Math.round(recent.filter((check) => check.ok).length / recent.length * 100) : null;
-      const last = checks.at(-1);
-      return <section className="workspace-card monitor-card" key={monitor.id}><div className="monitor-card-head"><span className={`monitor-status-light ${monitor.status}`} /><div className="monitor-card-title"><strong>{monitor.name}</strong><a href={monitor.url} target="_blank" rel="noreferrer">{monitor.url}<ExternalLink size={11} /></a></div><span className={`monitor-status-chip ${monitor.status}`}>{monitor.checking ? 'CHECKING' : monitor.status === 'up' ? 'UP' : monitor.status === 'down' ? 'DOWN' : 'WAITING'}</span><button className="icon-only danger-icon" onClick={() => onRemove(monitor.id)} aria-label={`Remove ${monitor.name}`}><X size={14} /></button></div><div className="monitor-metrics"><div><span>RESPONSE</span><strong>{last ? `${last.durationMs} ms` : '—'}</strong></div><div><span>HTTP</span><strong>{last?.statusCode || '—'}</strong></div><div><span>UPTIME</span><strong>{uptime === null ? '—' : `${uptime}%`}</strong></div><div><span>STATE</span><strong>{monitorStateDuration(monitor)}</strong></div></div><div className="monitor-card-actions"><label>Check interval<select value={monitor.intervalSec || 60} onChange={(event) => onInterval(monitor.id, event.target.value)}><option value="60">1 minute</option><option value="300">5 minutes</option><option value="900">15 minutes</option></select></label><span>{last ? `Last ping ${timeAgo(last.checkedAt)}${last.error ? ` · ${last.error}` : ''}` : 'No checks yet'}</span><button className="soft-button" onClick={() => onPing(monitor.id)} disabled={monitor.checking}><Radio size={13} /> Ping now</button></div><details className="monitor-log-details"><summary><Activity size={13} /> Recent ping log <span>{checks.length}</span><ChevronDown size={13} /></summary><div className="monitor-log-list">{checks.slice(-20).reverse().map((check, index) => <div className="monitor-log-row" key={`${check.checkedAt}_${index}`}><i className={check.ok ? 'ok' : 'bad'} /><time>{timeLabel(check.checkedAt)}</time><span>{check.ok ? 'Responded' : check.error || 'No response'}</span><strong>{check.statusCode || '—'} · {check.durationMs} ms</strong></div>)}</div></details></section>;
-    })}{!monitors.length && <div className="recent-empty"><strong>No URLs monitored yet</strong><span>Add your deployed URL to start collecting checks while StackPilot is open.</span></div>}</div>
+    <div className="monitor-list">{monitors.map((monitor) => <MonitorCard key={monitor.id} monitor={monitor} onPing={onPing} onRemove={onRemove} onInterval={onInterval} />)}{!monitors.length && <div className="recent-empty"><strong>No URLs monitored yet</strong><span>Add your deployed URL to start collecting checks while StackPilot is open.</span></div>}</div>
     <div className="monitor-external-note"><strong>Need checks while StackPilot is closed?</strong><span>Use an external uptime service with this public health endpoint for StackPilot itself: <code>{typeof window !== 'undefined' ? `${window.location.origin}/api/health` : '/api/health'}</code>. No UptimeRobot account is connected here.</span></div>
   </main></div>;
 }

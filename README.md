@@ -1,6 +1,6 @@
 # StackPilot — AI Build Studio
 
-StackPilot accepts pasted code, source ZIPs, or existing GitHub repositories. It opens an editable project workspace, runs real GitHub Actions checks, and can deploy to Render **only after the current GitHub checks pass**. It also includes a browser-based URL monitor, PWA install assets, and optional Web Push notifications.
+StackPilot accepts pasted code, source ZIPs, or existing GitHub repositories. It opens an editable project workspace, runs real GitHub Actions checks, and can deploy to Render **only after the current GitHub checks pass**. It also includes per-project uptime and Render panels, an all-projects shelf with Recent/Live/Drafts filters, PWA install assets, and optional Web Push notifications.
 
 ## Release paths
 
@@ -20,7 +20,7 @@ The project workspace includes an editor, preview, actual action logs, temporary
 
 ## URL monitors
 
-The Monitor page can ping any public HTTP(S) URL without sending cookies or credentials. It records status, HTTP code, latency, recent checks, uptime percentage, and current up/down duration in this browser. Checks run at a minimum 60-second interval **while StackPilot is open and visible**; the local history is not an external monitoring service and stops when the browser is closed. For independent checks, add each URL to an external provider such as UptimeRobot. StackPilot's public health endpoint is `/api/health` (or plain `/health`). No UptimeRobot account/API access is included.
+Each project has its own Uptime tab for its Render URL and any additional public HTTP(S) endpoints, without sending cookies or credentials. Project cards also show Render and monitor state. The Monitor page can show all endpoints together. StackPilot records status, HTTP code, latency, recent checks, uptime percentage, and current up/down duration in this browser. Checks run at a minimum 60-second interval **while StackPilot is open and visible**; the local history is not an external monitoring service and stops when the browser is closed. For independent checks, add each URL to an external provider such as UptimeRobot. StackPilot's public health endpoint is `/api/health` (or plain `/health`). No UptimeRobot account/API access is included.
 
 ## Security and storage
 
