@@ -173,22 +173,32 @@ function App() {
     window.setTimeout(() => setToastList((items) => items.filter((item) => item.id !== id)), 4500);
   }, []);
 
-  const submitUnlock = async (event) => {
-    event.preventDefault();
-    if (!unlockInput.trim()) { setUnlockError('Enter your app passcode to continue.'); return; }
-    if (health.appPinRequired && !/^\d{4}$/.test(unlockInput)) { setUnlockError('Enter the four-digit app PIN.'); return; }
+  const submitUnlock = async (event, submittedValue) => {
+    event?.preventDefault?.();
+    const code = String(submittedValue ?? unlockInput).trim();
+    if (!code) { setUnlockError('Enter your app passcode to continue.'); return; }
+    if (health.appPinRequired && !/^\d{4}$/.test(code)) { setUnlockError('Enter the four-digit app PIN.'); return; }
     setUnlockBusy(true);
     setUnlockError('');
     try {
-      const response = await fetch('/api/auth/check', { method: 'POST', headers: { 'content-type': 'application/json', 'x-app-password': unlockInput } });
+      const response = await fetch('/api/auth/check', { method: 'POST', headers: { 'content-type': 'application/json', 'x-app-password': code } });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.error || (response.status === 429 ? 'Too many attempts. Wait ten minutes and try again.' : 'That passcode did not match. Try again.'));
-      setConnectors((current) => ({ ...current, appPassword: unlockInput }));
+      setConnectors((current) => ({ ...current, appPassword: code }));
       setAccessGranted(true);
       setUnlockError('');
     } catch (error) {
       setUnlockError(error.message || 'Could not unlock the workspace.');
+      if (health.appPinRequired) setUnlockInput('');
     } finally { setUnlockBusy(false); }
+  };
+
+  const logoutFromGate = () => {
+    try { sessionStorage.removeItem('stackpilot.password.session'); } catch { /* storage may be disabled */ }
+    setConnectors((current) => ({ ...current, appPassword: '' }));
+    setUnlockInput('');
+    setUnlockError('');
+    setAccessGranted(false);
   };
 
   const updateProject = useCallback((id, patch) => {
@@ -795,7 +805,7 @@ function App() {
   if (loading) return <div className="app-loading"><img src="/stackpilot-icon.png" alt="" /><span>Preparing your workspace…</span></div>;
   if (health.authRequired && !accessGranted) return <AccessGate
     appPinRequired={health.appPinRequired} value={unlockInput} onChange={(value) => { setUnlockInput(value); setUnlockError(''); }}
-    busy={unlockBusy} error={unlockError} onSubmit={submitUnlock}
+    busy={unlockBusy} error={unlockError} onSubmit={submitUnlock} onLogout={logoutFromGate}
   />;
 
   return (
@@ -844,23 +854,102 @@ function App() {
   );
 }
 
-function AccessGate({ appPinRequired, value, onChange, busy, error, onSubmit }) {
-  return <main className="access-gate-page">
-    <div className="access-gate-top"><img src="/stackpilot-icon.png" alt="" /><div><strong>stackpilot</strong><small>PRIVATE BUILD STUDIO</small></div></div>
-    <section className="access-gate-card" aria-labelledby="access-gate-title">
-      <div className="access-gate-symbol"><LockKeyhole size={26} strokeWidth={1.8} /></div>
-      <div className="access-gate-eyebrow"><span /> PRIVATE WORKSPACE</div>
-      <h1 id="access-gate-title">Your work,<br /><em>right where you left it.</em></h1>
-      <p>Enter your {appPinRequired ? 'four-digit app PIN' : 'workspace passcode'} to open StackPilot.</p>
+function AccessGate({ appPinRequired, value, onChange, busy, error, onSubmit, onLogout }) {
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [splashVisible, setSplashVisible] = useState(true);
+  const [splashLeaving, setSplashLeaving] = useState(false);
+  const submitTimer = useRef(null);
+
+  useEffect(() => {
+    const reducedMotion = Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
+    const fadeTimer = window.setTimeout(() => setSplashLeaving(true), reducedMotion ? 0 : 850);
+    const hideTimer = window.setTimeout(() => setSplashVisible(false), reducedMotion ? 180 : 1320);
+    return () => { window.clearTimeout(fadeTimer); window.clearTimeout(hideTimer); };
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(submitTimer.current), []);
+
+  const handleDigit = (digit) => {
+    if (busy || !appPinRequired || value.length >= 4) return;
+    const next = `${value}${digit}`.slice(0, 4);
+    onChange(next);
+    if (next.length === 4) {
+      window.clearTimeout(submitTimer.current);
+      submitTimer.current = window.setTimeout(() => onSubmit(null, next), 170);
+    }
+  };
+
+  const handleBackspace = () => {
+    if (busy) return;
+    window.clearTimeout(submitTimer.current);
+    onChange(value.slice(0, -1));
+  };
+
+  useEffect(() => {
+    if (!appPinRequired || splashVisible) return undefined;
+    const handleKeyDown = (event) => {
+      if (busy || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (/^\d$/.test(event.key)) { event.preventDefault(); handleDigit(event.key); }
+      else if (event.key === 'Backspace') { event.preventDefault(); handleBackspace(); }
+      else if (event.key === 'Escape') { window.clearTimeout(submitTimer.current); setHelpOpen(false); onChange(''); }
+      else if (event.key === 'Enter' && value.length === 4) { event.preventDefault(); window.clearTimeout(submitTimer.current); onSubmit(event, value); }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [appPinRequired, splashVisible, busy, value, onChange, onSubmit]);
+
+  const handleLogout = () => {
+    window.clearTimeout(submitTimer.current);
+    setHelpOpen(false);
+    onLogout?.();
+  };
+
+  if (splashVisible) return <div className={`pin-splash${splashLeaving ? ' is-exiting' : ''}`} role="status" aria-label="Opening StackPilot">
+    <div className="pin-splash-lockup">
+      <img src="/stackpilot-icon-192.png" alt="" />
+      <span>stackpilot</span>
+    </div>
+  </div>;
+
+  return <main className={`access-gate-page pin-gate-page${error ? ' has-error' : ''}`}>
+    <header className="pin-gate-header">
+      <button className="pin-gate-action" type="button" onClick={handleLogout} disabled={busy}>Log out</button>
+      <button className="pin-gate-action pin-gate-help-action" type="button" onClick={() => setHelpOpen((open) => !open)} aria-expanded={helpOpen}>
+        <CircleHelp size={19} strokeWidth={1.8} /> Help
+      </button>
+    </header>
+
+    {appPinRequired ? <section className="pin-gate-main" aria-labelledby="pin-gate-title">
+      <img className="pin-gate-app-icon" src="/stackpilot-icon-192.png" alt="StackPilot app icon" />
+      <h1 id="pin-gate-title">Welcome back</h1>
+      <p className="pin-gate-subtitle">Enter your login PIN to continue</p>
+      <div className={`pin-gate-indicators${error ? ' is-error' : ''}`} role="img" aria-label={`${value.length} of 4 PIN digits entered`}>
+        {Array.from({ length: 4 }, (_, index) => <span key={index} className={index < value.length ? 'is-filled' : ''} />)}
+      </div>
+      <div className="pin-gate-error-slot" role="alert" aria-live="assertive">{error || ''}</div>
+      <div className="pin-gate-keypad" role="group" aria-label="PIN keypad">
+        {'123456789'.split('').map((digit) => <button className="pin-gate-key" key={digit} type="button" onClick={() => handleDigit(digit)} disabled={busy} aria-label={`Digit ${digit}`}>{digit}</button>)}
+        <span className="pin-gate-key-spacer" aria-hidden="true" />
+        <button className="pin-gate-key" type="button" onClick={() => handleDigit('0')} disabled={busy} aria-label="Digit zero">0</button>
+        <button className="pin-gate-key pin-gate-delete" type="button" onClick={handleBackspace} disabled={busy || !value.length} aria-label="Delete last digit">
+          <svg viewBox="0 0 32 24" aria-hidden="true"><path d="M11 3.5h17v17H11L3 12l8-8.5Z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" /><path d="m17 8 7 8m0-8-7 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>
+        </button>
+      </div>
+      <button className="pin-gate-forgot" type="button" onClick={() => setHelpOpen((open) => !open)} aria-expanded={helpOpen}>Forgot PIN?</button>
+      {helpOpen && <div className="pin-gate-help-note" role="status">For a secure reset, contact the StackPilot workspace owner. PIN checks stay on the server.</div>}
+    </section> : <section className="access-gate-card pin-gate-legacy" aria-labelledby="access-gate-title">
+      <img className="pin-gate-app-icon" src="/stackpilot-icon-192.png" alt="StackPilot app icon" />
+      <h1 id="access-gate-title">Welcome back</h1>
+      <p>Enter your workspace passcode to continue.</p>
       <form onSubmit={onSubmit}>
-        <label className="access-code-label" htmlFor="access-code">{appPinRequired ? 'APP PIN' : 'WORKSPACE PASSCODE'}</label>
-        <input id="access-code" className="access-code-input" type="password" inputMode={appPinRequired ? 'numeric' : 'text'} autoComplete={appPinRequired ? 'one-time-code' : 'current-password'} autoCapitalize="off" autoCorrect="off" maxLength={appPinRequired ? 4 : 128} value={value} onChange={(event) => onChange(appPinRequired ? event.target.value.replace(/\D/g, '').slice(0, 4) : event.target.value)} placeholder={appPinRequired ? '••••' : 'Enter your passcode'} aria-label={appPinRequired ? 'Four-digit app PIN' : 'Workspace passcode'} aria-invalid={Boolean(error)} />
+        <label className="access-code-label" htmlFor="access-code">WORKSPACE PASSCODE</label>
+        <input id="access-code" className="access-code-input" type="password" autoComplete="current-password" autoCapitalize="off" autoCorrect="off" value={value} onChange={(event) => onChange(event.target.value)} placeholder="Enter your passcode" aria-label="Workspace passcode" aria-invalid={Boolean(error)} />
         {error && <div className="access-gate-error" role="alert"><AlertTriangle size={15} />{error}</div>}
         <button className="access-unlock-button" type="submit" disabled={busy}>{busy ? <><Loader2 size={17} className="spin" /> Checking passcode…</> : <>Open my workspace <ArrowRight size={17} /></>}</button>
       </form>
-      <div className="access-gate-foot"><ShieldCheck size={15} /> Protected by your server-side workspace code</div>
-    </section>
-    <footer className="access-gate-bottom">A focused space for building and shipping.</footer>
+      <button className="pin-gate-forgot" type="button" onClick={() => setHelpOpen((open) => !open)} aria-expanded={helpOpen}>Need help?</button>
+      {helpOpen && <div className="pin-gate-help-note" role="status">Contact the StackPilot workspace owner to reset access.</div>}
+    </section>}
   </main>;
 }
 
