@@ -1,7 +1,7 @@
 import { isBinaryAsset } from './projectFiles.js';
 
 export const STEPS = [
-  { id: 'organize', label: 'Architect', role: 'OpenRouter Free Architect', detail: 'Uses the free router only when a pasted brief needs structure.' },
+  { id: 'organize', label: 'Architect', role: 'OpenRouter Free Architect', detail: 'Reads the complete text intake in bounded segments when model organization is needed.' },
   { id: 'preflight', label: 'Safety', role: 'Safety & Build Guard', detail: 'Checks paths, secrets, imports, and setup.' },
   { id: 'github', label: 'Release', role: 'GitHub Release Agent', detail: 'Commits the verified project and workflow.' },
   { id: 'runner', label: 'Build', role: 'Build & Test Agent', detail: 'Runs real tests and production build in GitHub Actions.' },
@@ -10,13 +10,12 @@ export const STEPS = [
 
 const WEIGHTS = { organize: 16, preflight: 14, github: 22, runner: 25, render: 23 };
 export function calculateProgress(steps = {}, status = '', reported = null) {
-  if (['live', 'verified'].includes(status)) return 100;
+  if (status === 'live') return 100;
   if (Number.isFinite(Number(reported)) && Number(reported) > 0) return Math.max(1, Math.min(96, Math.round(Number(reported))));
-  return Math.round(Object.entries(WEIGHTS).reduce((value, [step, weight]) => {
-    if (steps[step] === 'done') return value + weight;
-    if (steps[step] === 'running') return value + weight * 0.35;
-    return value;
-  }, 0));
+  // Credit only a phase confirmed complete by its actual result; running and skipped phases add nothing.
+  return Math.round(Object.entries(WEIGHTS).reduce((value, [step, weight]) => (
+    steps[step] === 'done' ? value + weight : value
+  ), 0));
 }
 
 export function detectEnvKeys(files = {}) {

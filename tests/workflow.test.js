@@ -2,9 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateProgress, detectEnvKeys } from '../src/workflow.js';
 
-test('progress follows completed specialist stages and finishes for a verified build', () => {
-  assert.equal(calculateProgress({ organize: 'done', preflight: 'running' }, 'running'), 21);
-  assert.equal(calculateProgress({}, 'verified', 77), 100);
+test('progress credits only completed operations and distinguishes verified from live', () => {
+  assert.equal(calculateProgress({ organize: 'done', preflight: 'running' }, 'running'), 16);
+  assert.equal(calculateProgress({ organize: 'running' }, 'running'), 0);
+  assert.equal(calculateProgress({ organize: 'skipped', preflight: 'done' }, 'running'), 14);
+  assert.equal(calculateProgress({}, 'verified', 77), 77);
+  assert.equal(calculateProgress({}, 'live', 77), 100);
   assert.equal(calculateProgress({}, 'running', 140), 96);
 });
 

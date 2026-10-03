@@ -6,14 +6,14 @@ import {
   Github, Globe, HardDrive, KeyRound, Loader2, LockKeyhole, Menu, Monitor,
   Plus, Radio, Rocket, Save, Search, Settings2, ShieldCheck, Smartphone, Sparkles,
   Terminal, Trash2, Download, FileArchive, GitBranch, Timer, Wifi, X, Zap,
-  ArrowUp, History, Image as ImageIcon, MessageSquareText, Paperclip,
+  ArrowUp, History, Image as ImageIcon, MessageSquareText, Minus, Paperclip,
 } from 'lucide-react';
 import { createProjectId, getProjects, removeProject, saveProject } from './storage.js';
 import { STEPS, calculateProgress, detectEnvKeys } from './workflow.js';
 import { prepareAttachments } from './attachmentImport.js';
 import { normalizeMonitorUrl } from './monitor.js';
 import { binaryAssetByteLength, binaryAssetDataUri, isBinaryAsset, parseBinaryAsset } from './projectFiles.js';
-import { MAX_PROJECT_BYTES, MAX_PROJECT_FILE_BYTES, MAX_PROJECT_FILE_COUNT, MAX_RAW_INPUT_CHARS } from './limits.js';
+import { MAX_PROJECT_BYTES, MAX_PROJECT_FILE_BYTES, MAX_PROJECT_FILE_COUNT } from './limits.js';
 
 const SECRET_KEYS = { githubTokenExpiresAt: 'stackpilot.github.expires' };
 const LEGACY_SESSION_SECRET_KEYS = [
@@ -34,7 +34,7 @@ function newProject(name = 'Untitled project') {
     serviceType: 'web_service', runtime: 'node', region: 'frankfurt', buildCommand: 'npm install && npm run build',
     startCommand: 'npm start', publishPath: 'dist', rootDir: '', summary: '', stack: '', status: 'draft',
     steps: Object.fromEntries(STEPS.map((step) => [step.id, 'idle'])), logs: [], createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(), autoDeploy: true, jobId: '', progress: 0, activeAgent: '',
+    updatedAt: new Date().toISOString(), autoDeploy: true, jobId: '', progress: 0, progressDetail: null, activeAgent: '',
   };
 }
 function clearLegacySessionSecrets() {
@@ -407,7 +407,7 @@ function App() {
           pollCursor.current.set(project.jobId, { after: data.sequence || cursor.after, version: data.patchVersion || cursor.version });
           const patch = data.patch || {};
           if (Object.keys(patch).length && patch.files) updateProjectFiles(project.id, patch.files);
-          if ((data.logs || []).length || Object.keys(patch).length || project.progress !== data.progress || project.activeAgent !== data.activeAgent || project.status !== data.status) {
+          if ((data.logs || []).length || Object.keys(patch).length || project.progress !== data.progress || project.activeAgent !== data.activeAgent || project.status !== data.status || JSON.stringify(project.progressDetail || null) !== JSON.stringify(data.progressDetail || null)) {
             updateProject(project.id, (current) => {
               const mappedStatus = data.status === 'failed' ? 'needs_attention' : data.status;
               const status = patch.status || mappedStatus;
@@ -416,6 +416,7 @@ function App() {
               const freshLogs = newLogs.filter((entry) => !oldIds.has(entry.jobLogId));
               return {
                 ...current, ...patch, status, steps: data.steps || current.steps, progress: data.progress,
+                progressDetail: data.progressDetail || null,
                 activeAgent: data.activeAgent || '', workflowUrl: data.workflowUrl || current.workflowUrl || '',
                 logs: [...(current.logs || []), ...freshLogs].slice(-180), jobId: ['queued', 'running'].includes(data.status) ? data.id : current.jobId,
               };
@@ -718,7 +719,7 @@ function App() {
     const runProject = { ...project };
     if (project.status === 'verified' && Object.keys(project.files || {}).length) runProject.rawInput = '';
     const envVars = (project.id === activeId ? projectEnv : projectEnvRows[project.id] || []).filter((row) => row.key && row.value !== undefined).map(({ key, value }) => ({ key, value: String(value) }));
-    updateProject(project.id, { status: 'running', progress: 0, activeAgent: 'StackPilot orchestrator', jobId: '', steps: Object.fromEntries(STEPS.map((step) => [step.id, 'idle'])) });
+    updateProject(project.id, { status: 'running', progress: 0, progressDetail: null, activeAgent: 'StackPilot orchestrator', jobId: '', steps: Object.fromEntries(STEPS.map((step) => [step.id, 'idle'])) });
     appendLog(project.id, 'Background run requested. StackPilot keeps working server-side if you leave the page.', 'info', 'Orchestrator');
     try {
       const started = await api('/api/jobs', {
@@ -759,6 +760,7 @@ function App() {
     if (!shellCommand.trim()) { showToast('Enter a command for the temporary runner.', 'error'); return; }
     setShellBusy(true);
     const captureAt = Date.now();
+    const actionStates = new Map();
     appendLog(active.id, `Queueing temporary GitHub runner command: ${shellCommand}`, 'info', 'Remote shell');
     try {
       await api('/api/github/dispatch', { token: credentials.githubToken, projectId: active.id, repository: active.repo, branch: active.branch || 'main', command: shellCommand });
@@ -767,6 +769,16 @@ function App() {
       while (waited < 7 * 60_000) {
         const info = await api('/api/github/runs', { token: credentials.githubToken, projectId: active.id, repository: active.repo, branch: active.branch || 'main', since: new Date(captureAt).toISOString() });
         if (info.found) {
+          for (const actionJob of info.jobs || []) {
+            const jobState = `${actionJob.status || 'unknown'}${actionJob.conclusion ? ` · ${actionJob.conclusion}` : ''}`;
+            const jobKey = `job:${actionJob.name}`;
+            if (actionStates.get(jobKey) !== jobState) { actionStates.set(jobKey, jobState); appendLog(active.id, `GitHub job “${actionJob.name}”: ${jobState}.`, actionJob.conclusion === 'failure' ? 'error' : 'info', 'GitHub Actions'); }
+            for (const step of actionJob.steps || []) {
+              const stepState = `${step.status || 'unknown'}${step.conclusion ? ` · ${step.conclusion}` : ''}`;
+              const stepKey = `step:${actionJob.name}:${step.number || step.name}`;
+              if (actionStates.get(stepKey) !== stepState) { actionStates.set(stepKey, stepState); appendLog(active.id, `Action step “${step.name}”: ${stepState}.`, step.conclusion === 'failure' ? 'error' : 'info', 'GitHub Actions'); }
+            }
+          }
           const label = `${info.status}${info.conclusion ? ` · ${info.conclusion}` : ''}`;
           if (label !== last) { appendLog(active.id, `Temporary runner ${label}${info.url ? ` · ${info.url}` : ''}`, info.conclusion === 'failure' ? 'error' : 'info', 'Remote shell'); last = label; }
           if (info.status === 'completed') {
@@ -1083,7 +1095,7 @@ function StartPage({ input, setInput, filesCount, zipFilename, zipBusy, onAddFil
 
       <div className="chat-composer-card">
         <label className="chat-composer-label" htmlFor="stackpilot-prompt">{sourceMode === 'github' ? 'Optional build instructions' : 'Message StackPilot'}</label>
-        <textarea id="stackpilot-prompt" ref={promptRef} value={input} onChange={(event) => { const value = event.target.value; if (value.length > MAX_RAW_INPUT_CHARS) { onShowToast(`Paste limit is ${MAX_RAW_INPUT_CHARS.toLocaleString()} characters. The previous text was kept unchanged; attach a ZIP or GitHub repository for larger source.`, 'error'); return; } setInput(value); }} placeholder={sourceMode === 'github' ? 'Add a note for this repository, if you like…' : 'Describe your idea, paste code, or add a brief…'} rows={2} />
+        <textarea id="stackpilot-prompt" ref={promptRef} value={input} onChange={(event) => setInput(event.target.value)} placeholder={sourceMode === 'github' ? 'Add a note for this repository, if you like…' : 'Describe your idea, paste code, or add a brief…'} rows={2} />
         <div className="chat-composer-toolbar"><div className="chat-composer-left-tools"><button type="button" className={`chat-attach-button ${attachmentMenuOpen ? 'is-active' : ''}`} onClick={() => setAttachmentMenuOpen((open) => !open)} aria-label="Add images, files, or a repository" aria-expanded={attachmentMenuOpen}><Paperclip size={18} /></button><button type="button" className="chat-add-label" onClick={() => setAttachmentMenuOpen((open) => !open)}>{zipBusy ? 'Adding…' : 'Add files'}</button>{filesCount > 0 && <span className="chat-attachment-count">{filesCount} files</span>}</div><div className="chat-composer-right-tools"><label className="chat-auto-deploy" title="Deploy only after GitHub checks pass"><input type="checkbox" checked={autoDeploy} onChange={(event) => setAutoDeploy(event.target.checked)} /><span className="chat-auto-switch" /><span>Checks → deploy</span></label><button type="submit" className="chat-send-button" disabled={zipBusy || (sourceMode === 'github' ? (!repo.trim() || importingGithub) : (!input.trim() && !filesCount))} aria-label={sourceMode === 'github' ? 'Import GitHub repository' : 'Create project workspace'}>{importingGithub ? <Loader2 size={18} className="spin" /> : sourceMode === 'github' ? <GitBranch size={18} /> : <ArrowUp size={20} />}</button></div></div>
       </div>
       <div className="chat-composer-footnote"><LockKeyhole size={12} /><span>Credentials stay separate from source files.</span><span className="chat-footnote-divider" /><span>{zipFilename || 'Images are stored with the project; free-model organization reads text, not image pixels.'}</span></div>
@@ -1144,8 +1156,8 @@ function ProjectWorkspace({ project, credentials, envConfigured, projectVault, p
       {tab === 'build' && <div className="build-layout">
         <section className="build-primary-column">
           <div className="workspace-card code-input-card">
-            <div className="card-header"><div className="card-title-icon violet"><Sparkles size={16} /></div><div><strong>Code & direction</strong><span>Paste, revise, or add a specific request for the agents.</span></div><span className="character-count">{(project.rawInput || '').length.toLocaleString()} / {MAX_RAW_INPUT_CHARS.toLocaleString()} chars</span></div>
-            <textarea className="workspace-dump" value={project.rawInput || ''} onChange={(event) => { const value = event.target.value; if (value.length > MAX_RAW_INPUT_CHARS) { onShowToast(`Paste limit is ${MAX_RAW_INPUT_CHARS.toLocaleString()} characters. Existing project text was kept unchanged; split larger input into files.`, 'error'); return; } onProjectChange({ rawInput: value }); }} placeholder="Paste your code dump or describe the project…" aria-label="Project code and instructions" />
+            <div className="card-header"><div className="card-title-icon violet"><Sparkles size={16} /></div><div><strong>Code & direction</strong><span>Paste, revise, or add a specific request for the agents.</span></div><span className="character-count">{(project.rawInput || '').length.toLocaleString()} chars · kept in full</span></div>
+            <textarea className="workspace-dump" value={project.rawInput || ''} onChange={(event) => onProjectChange({ rawInput: event.target.value })} placeholder="Paste your code dump or describe the project…" aria-label="Project code and instructions" />
             <div className="dump-footer"><span><LockKeyhole size={12} /> Credentials are never added to the commit</span><button className="small-action" onClick={() => onShowToast('Paste updates from your starter brief; the file editor stays in the Files tab.', 'info')}>How it works <CircleHelp size={13} /></button></div>
           </div>
 
@@ -1186,23 +1198,28 @@ function ProgressPanel({ project, progress, compact = false }) {
   const current = STEPS[Math.max(0, runningIndex)];
   const finished = ['live', 'verified'].includes(project.status);
   const hasStarted = project.status !== 'draft' && project.status !== 'ready';
+  const lastLog = project.logs?.at(-1);
+  const latestActivity = project.progressDetail?.message || (lastLog ? `${lastLog.source || 'StackPilot'} · ${lastLog.text}` : 'Render will wait for a passing GitHub build.');
   return <section className={`progress-card ${compact ? 'progress-compact' : ''} ${hasStarted ? 'progress-active' : ''}`} aria-live="polite">
-    <div className="progress-top"><div className="progress-heading"><div className={`progress-emblem ${hasStarted && !finished ? 'emblem-working' : ''}`}><Sparkles size={17} /></div><div><div className="progress-eyebrow">{finished ? 'RUN COMPLETE' : hasStarted ? 'SPECIALISTS AT WORK' : 'READY WHEN YOU ARE'}</div><strong>{finished ? (project.status === 'live' ? 'Your project is live.' : 'GitHub checks passed.') : hasStarted ? (project.activeAgent || current.role) : 'Five clear steps. No black box.'}</strong><span>{finished ? 'Source is in GitHub, with a result you can revisit anytime.' : hasStarted ? 'This run continues on the server if you leave the page.' : 'Each agent owns one visible part of the build.'}</span></div></div><div className="progress-value"><strong>{hasStarted ? progress : 0}<small>%</small></strong><span>{finished ? 'complete' : 'progress'}</span></div></div>
+    <div className="progress-top"><div className="progress-heading"><div className={`progress-emblem ${hasStarted && !finished ? 'emblem-working' : ''}`}><Sparkles size={17} /></div><div><div className="progress-eyebrow">{project.status === 'live' ? 'RUN COMPLETE' : project.status === 'verified' ? 'CHECKS PASSED' : hasStarted ? 'SPECIALISTS AT WORK' : 'READY WHEN YOU ARE'}</div><strong>{finished ? (project.status === 'live' ? 'Your project is live.' : 'GitHub checks passed.') : hasStarted ? (project.activeAgent || current.role) : 'Five clear steps. No black box.'}</strong><span>{finished ? 'The final result reflects only the checks and deployment that actually completed.' : hasStarted ? 'Phase progress advances after confirmed results; current work appears in the live log.' : 'Each agent owns one visible part of the build.'}</span></div></div><div className="progress-value"><strong>{hasStarted ? progress : 0}<small>%</small></strong><span>{project.status === 'live' ? 'complete' : project.status === 'verified' ? 'checks' : 'progress'}</span></div></div>
     <div className="progress-track" role="progressbar" aria-valuenow={hasStarted ? progress : 0} aria-valuemin="0" aria-valuemax="100"><span style={{ width: `${hasStarted ? progress : 0}%` }} /><i /></div>
     <div className="agent-track">{STEPS.map((step, index) => {
       const state = steps[step.id] || 'idle';
       const Icon = [Sparkles, ShieldCheck, Github, Terminal, Rocket][index];
-      return <div className={`agent-track-item agent-${state}`} key={step.id}><div className="agent-track-icon">{state === 'running' ? <Loader2 size={14} className="spin" /> : state === 'done' ? <Check size={14} /> : state === 'error' ? <AlertTriangle size={14} /> : <Icon size={14} />}</div><div><small>AGENT {String(index + 1).padStart(2, '0')}</small><strong>{step.label}</strong><span>{step.role}</span></div></div>;
+      return <div className={`agent-track-item agent-${state}`} key={step.id}><div className="agent-track-icon">{state === 'running' ? <Loader2 size={14} className="spin" /> : state === 'done' ? <Check size={14} /> : state === 'error' ? <AlertTriangle size={14} /> : state === 'skipped' ? <Minus size={14} /> : <Icon size={14} />}</div><div><small>AGENT {String(index + 1).padStart(2, '0')}</small><strong>{step.label}</strong><span>{state === 'skipped' ? 'Not run' : step.role}</span></div></div>;
     })}</div>
-    <div className="progress-foot"><span className="progress-live-indicator"><i />{hasStarted && !finished ? 'LIVE UPDATE' : finished ? 'CHECKPOINT SAVED' : 'GITHUB → TESTS → RENDER'}</span><span className="progress-latest">{project.logs?.length ? `${project.logs.at(-1).source || 'StackPilot'} · ${project.logs.at(-1).text}` : 'Render will wait for a passing GitHub build.'}</span></div>
+    <div className="progress-foot"><span className="progress-live-indicator"><i />{hasStarted && !finished ? 'LIVE UPDATE' : finished ? 'CHECKPOINT SAVED' : 'GITHUB → TESTS → RENDER'}</span><span className="progress-latest" title={latestActivity}>{latestActivity}</span></div>
   </section>;
 }
 
 function AgentRoster({ project }) {
-  return <section className="agent-roster"><div className="roster-header"><span className="section-eyebrow">THE BUILD CREW</span><span>{Object.values(project.steps || {}).filter((state) => state === 'done').length}/{STEPS.length} done</span></div>{STEPS.map((step, index) => {
+  const states = Object.values(project.steps || {});
+  const done = states.filter((state) => state === 'done').length;
+  const skipped = states.filter((state) => state === 'skipped').length;
+  return <section className="agent-roster"><div className="roster-header"><span className="section-eyebrow">THE BUILD CREW</span><span>{done} done{skipped ? ` · ${skipped} skipped` : ''}</span></div>{STEPS.map((step, index) => {
     const Icon = [Sparkles, ShieldCheck, Github, Terminal, Rocket][index];
     const state = project.steps?.[step.id] || 'idle';
-    return <div className={`roster-agent roster-${state}`} key={step.id}><span className="roster-icon">{state === 'running' ? <Loader2 size={14} className="spin" /> : state === 'done' ? <Check size={14} /> : <Icon size={14} />}</span><span><strong>{step.role}</strong><small>{step.detail}</small></span><i>{state === 'done' ? 'DONE' : state === 'running' ? 'ACTIVE' : state === 'error' ? 'FIX' : 'READY'}</i></div>;
+    return <div className={`roster-agent roster-${state}`} key={step.id}><span className="roster-icon">{state === 'running' ? <Loader2 size={14} className="spin" /> : state === 'done' ? <Check size={14} /> : state === 'skipped' ? <Minus size={14} /> : <Icon size={14} />}</span><span><strong>{step.role}</strong><small>{state === 'skipped' ? 'Not run · see activity log for why.' : step.detail}</small></span><i>{state === 'done' ? 'DONE' : state === 'running' ? 'ACTIVE' : state === 'error' ? 'FIX' : state === 'skipped' ? 'SKIPPED' : 'READY'}</i></div>;
   })}</section>;
 }
 
@@ -1219,7 +1236,7 @@ function ActivityPanel({ project, onClear }) {
 
 function ReleaseSummary({ project, canDeploy, autoDeploy, onToggleAutoDeploy, onRun, busy, onSettings }) {
   const finished = ['live', 'verified'].includes(project.status);
-  return <section className="release-summary workspace-card"><div className="release-summary-head"><div className="card-title-icon green"><Rocket size={15} /></div><div><strong>Release gate</strong><span>Render waits for GitHub success</span></div><span className="free-chip"><i /> FREE</span></div><div className="release-repo-line"><Github size={14} /><span>{project.repo || 'Add owner/repo in release settings'}</span></div><label className="release-auto-toggle"><input type="checkbox" checked={autoDeploy} onChange={(event) => onToggleAutoDeploy(event.target.checked)} /><span className="toggle-ui small-toggle" /><span><strong>Auto-deploy</strong><small>{autoDeploy ? 'Publish after checks pass' : 'Review, then deploy manually'}</small></span></label>{project.status === 'verified' && !autoDeploy && <button className="primary-button side-deploy-button" onClick={onRun} disabled={busy}><Rocket size={14} /> Deploy verified build</button>}{project.renderUrl && <a className="release-live-link" href={project.renderUrl} target="_blank" rel="noreferrer"><Globe size={14} /><span>{project.renderUrl.replace(/^https?:\/\//, '')}</span><ArrowUpRight size={13} /></a>}{!canDeploy && <div className="release-needs-key"><KeyRound size={13} /> Add a Render key for this project or set the workspace fallback in Settings.</div>}<button className="release-settings-link" onClick={onSettings}><Settings2 size={13} /> Configure Render & connections</button>{finished && project.lastCommitUrl && <a className="commit-link" href={project.lastCommitUrl} target="_blank" rel="noreferrer"><CheckCircle2 size={13} /> View verified GitHub commit <ExternalLink size={12} /></a>}</section>;
+  return <section className="release-summary workspace-card"><div className="release-summary-head"><div className="card-title-icon green"><Rocket size={15} /></div><div><strong>Release gate</strong><span>Render waits for GitHub success</span></div><span className="free-chip"><i /> FREE</span></div><div className="release-repo-line"><Github size={14} /><span>{project.repo || 'Add owner/repo in release settings'}</span></div><label className="release-auto-toggle"><input type="checkbox" checked={autoDeploy} onChange={(event) => onToggleAutoDeploy(event.target.checked)} /><span className="toggle-ui small-toggle" /><span><strong>Auto-deploy</strong><small>{autoDeploy ? 'Publish after checks pass' : 'Review, then deploy manually'}</small></span></label>{project.status === 'verified' && !autoDeploy && <button className="primary-button side-deploy-button" onClick={onRun} disabled={busy}><Rocket size={14} /> Deploy verified build</button>}{project.renderUrl && <a className="release-live-link" href={project.renderUrl} target="_blank" rel="noreferrer"><Globe size={14} /><span>{project.renderUrl.replace(/^https?:\/\//, '')}</span><ArrowUpRight size={13} /></a>}{!canDeploy && <div className="release-needs-key"><KeyRound size={13} /><span>Add a Render key for this project or set the workspace fallback in Settings.</span></div>}<button className="release-settings-link" onClick={onSettings}><Settings2 size={13} /> Configure Render & connections</button>{finished && project.lastCommitUrl && <a className="commit-link" href={project.lastCommitUrl} target="_blank" rel="noreferrer"><CheckCircle2 size={13} /> View verified GitHub commit <ExternalLink size={12} /></a>}</section>;
 }
 
 function ReleaseSettings({ project, onRepoChange, onToggleAutoDeploy, onProjectChange, onSettings }) {
