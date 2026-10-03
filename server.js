@@ -11,6 +11,15 @@ import { containsPossibleSecret, validateRelativePath } from './src/safety.js';
 import { errorMessageForModelStatus, isOpenRouterRetryableStatus, normalizeFreeModel, normalizeOpenRouterKeys } from './src/openrouter.js';
 import { isPrivateOrReservedAddress, normalizeMonitorUrl } from './src/monitor.js';
 import { binaryAssetByteLength, encodeBinaryAsset, isBinaryAsset, parseBinaryAsset } from './src/projectFiles.js';
+import {
+  MAX_API_BODY_BYTES,
+  MAX_ORGANIZER_INPUT_CHARS,
+  MAX_ORGANIZER_SOURCE_BYTES,
+  MAX_PROJECT_BYTES,
+  MAX_PROJECT_FILE_BYTES,
+  MAX_PROJECT_FILE_COUNT,
+  MAX_RAW_INPUT_CHARS,
+} from './src/limits.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -18,7 +27,7 @@ const PORT = Number(process.env.PORT || 3000);
 let openRouterKeyCursor = 0;
 const authFailures = new Map();
 if (process.env.APP_PIN && !/^\d{4}$/.test(process.env.APP_PIN)) throw new Error('APP_PIN must be exactly four digits.');
-const BODY_LIMIT = '12mb';
+const BODY_LIMIT = MAX_API_BODY_BYTES;
 const GH_API = 'https://api.github.com';
 const RENDER_API = 'https://api.render.com/v1';
 const backgroundJobs = new Map();
@@ -26,7 +35,7 @@ const pushSubscriptions = new Map();
 const notifiedExpiryDays = new Set();
 const JOB_RETENTION_MS = 12 * 60 * 60 * 1000;
 const MAX_JOB_LOGS = 300;
-const BINARY_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', ico: 'image/x-icon', bmp: 'image/bmp', woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf', pdf: 'application/pdf', mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', mp4: 'video/mp4', webm: 'video/webm' };
+const BINARY_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', heic: 'image/heic', heif: 'image/heif', ico: 'image/x-icon', bmp: 'image/bmp', woff: 'font/woff', woff2: 'font/woff2', ttf: 'font/ttf', otf: 'font/otf', pdf: 'application/pdf', mp3: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav', ogg: 'audio/ogg', aac: 'audio/aac', mp4: 'video/mp4', m4v: 'video/x-m4v', mov: 'video/quicktime', webm: 'video/webm', doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', rtf: 'application/rtf', xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', odt: 'application/vnd.oasis.opendocument.text', ods: 'application/vnd.oasis.opendocument.spreadsheet', odp: 'application/vnd.oasis.opendocument.presentation', };
 const vapidConfigured = Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
 if (vapidConfigured) {
   webpush.setVapidDetails(
@@ -125,13 +134,13 @@ app.get('/api/health', (_req, res) => {
 app.get('/health', (_req, res) => res.status(200).type('text/plain').send('ok'));
 app.get('/uptime', (_req, res) => res.status(200).type('text/plain').send('ok'));
 
-function normalizeFiles(input, { maxFiles = 300, maxTotal = 3_000_000 } = {}) {
+function normalizeFiles(input, { maxFiles = MAX_PROJECT_FILE_COUNT, maxTotal = MAX_PROJECT_BYTES } = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw httpError('Expected a map of relative file paths to file contents.');
   }
   const entries = Object.entries(input);
   if (!entries.length) throw httpError('The organizer returned no files. Add source code and try again.');
-  if (entries.length > maxFiles) throw httpError(`Too many files. Limit is ${maxFiles}.`);
+  if (entries.length > maxFiles) throw httpError(`Too many files. Limit is ${maxFiles.toLocaleString()}.`);
   const out = {};
   let total = 0;
   for (const [rawPath, rawContent] of entries) {
@@ -144,9 +153,9 @@ function normalizeFiles(input, { maxFiles = 300, maxTotal = 3_000_000 } = {}) {
       bytes = binaryAssetByteLength(rawContent);
       if (!parsed || bytes < 0) throw httpError(`Binary asset encoding is invalid: ${rawPath}`);
     } else bytes = Buffer.byteLength(rawContent, 'utf8');
-    if (bytes > 750_000) throw httpError(`File is too large: ${rawPath}`);
+    if (bytes > MAX_PROJECT_FILE_BYTES) throw httpError(`File ${filePath} exceeds the ${Math.floor(MAX_PROJECT_FILE_BYTES / (1024 * 1024))} MB per-file limit.`);
     total += bytes;
-    if (total > maxTotal) throw httpError('Project is too large to process in one pass (3 MB total raw file limit).');
+    if (total > maxTotal) throw httpError(`Project exceeds the ${Math.floor(maxTotal / (1024 * 1024))} MB total file limit.`);
     out[filePath] = rawContent;
   }
   return out;
@@ -230,11 +239,18 @@ app.post('/api/organize', async (req, res, next) => {
     const apiKeys = normalizeOpenRouterKeys(req.body?.apiKeys || [req.body?.apiKey1, req.body?.apiKey2]);
     const suppliedFiles = req.body?.files && Object.keys(req.body.files).length ? normalizeFiles(req.body.files) : {};
     const modelFiles = Object.fromEntries(Object.entries(suppliedFiles).filter(([, content]) => !isBinaryAsset(content)));
-    if (typeof input !== 'string' || !input.trim()) throw httpError('Add a short project brief or code dump first.');
-    if (input.length > 40_000) throw httpError('Keep the project prompt under 40,000 characters to preserve free-model context.');
+    if (typeof input !== 'string' || !input.trim()) throw httpError('Add a project brief or code dump first.');
+    if (input.length > MAX_RAW_INPUT_CHARS) throw httpError(`Paste input is limited to ${MAX_RAW_INPUT_CHARS.toLocaleString()} characters. Use ZIP or GitHub import for larger files.`);
     if (containsPossibleSecret(input) || Object.values(modelFiles).some(containsPossibleSecret)) throw httpError('A live credential was detected. Remove or rotate it before sending source to OpenRouter.');
     const sourceBytes = Object.values(modelFiles).reduce((sum, value) => sum + Buffer.byteLength(value, 'utf8'), 0);
-    if (sourceBytes > 60_000) throw httpError('This project is too large for the free-model organize step (60 KB source limit). Use the ZIP/repository import, edit the files, and run the GitHub checks directly.');
+    if (sourceBytes > MAX_ORGANIZER_SOURCE_BYTES) {
+      return res.json({ skipped: true, files: {}, notes: [`The complete project and ${input.length.toLocaleString()}-character request were preserved. OpenRouter organization was skipped because its free-model source budget is ${MAX_ORGANIZER_SOURCE_BYTES.toLocaleString()} bytes; the files were not trimmed.`] });
+    }
+    const inputLimited = input.length > MAX_ORGANIZER_INPUT_CHARS;
+    const modelInput = input.slice(0, MAX_ORGANIZER_INPUT_CHARS);
+    const inputContextNote = inputLimited
+      ? `\n\n[Context limit: this is only the first ${MAX_ORGANIZER_INPUT_CHARS.toLocaleString()} characters of a ${input.length.toLocaleString()}-character project input. The complete input remains with the project. Do not assume the unseen remainder was reviewed.]`
+      : '';
     const system = [
       'You are StackPilot, a concise senior software engineer. Convert the user brief and any supplied source files into a coherent, runnable project.',
       'Return strict JSON with this shape: {"files":{"relative/path":"full file contents"},"summary":"short description","stack":"detected stack","deployType":"web_service or static_site","runtime":"node, python, ruby, go, or elixir","buildCommand":"... or empty","startCommand":"... or empty","publishPath":"dist, public, or .","testCommand":"... or empty","notes":["..." ]}.',
@@ -244,11 +260,13 @@ app.post('/api/organize', async (req, res, next) => {
       'Be accurate about assumptions and leave a short TODO when a required decision cannot be inferred. Do not claim tests or deployments have run. Output valid JSON only.',
     ].join('\n');
     const fileContext = Object.keys(modelFiles).length ? `\n\nCurrent text source files (JSON; return only changed/new files):\n${JSON.stringify(modelFiles)}` : '';
-    const user = `Project name: ${String(projectName || 'new-project').slice(0, 80)}\n\nTask / code dump:\n${input}${fileContext}`;
+    const user = `Project name: ${String(projectName || 'new-project').slice(0, 80)}\n\nTask / code dump:\n${modelInput}${inputContextNote}${fileContext}`;
     const raw = await callOpenRouter({ apiKeys, model, system, user, maxTokens: Object.keys(modelFiles).length ? 5000 : 7000 });
     const parsed = parseJsonResponse(raw);
     const files = parsed.files && Object.keys(parsed.files).length ? normalizeFiles(parsed.files) : {};
     if (!Object.keys(files).length && !Object.keys(suppliedFiles).length) throw httpError('The free model returned no files. Retry once or use the ZIP import path.', 502);
+    const notes = Array.isArray(parsed.notes) ? parsed.notes.slice(0, 11).map((n) => String(n).slice(0, 400)) : [];
+    if (inputLimited) notes.push(`Only the first ${MAX_ORGANIZER_INPUT_CHARS.toLocaleString()} characters were sent to the free model; the full ${input.length.toLocaleString()}-character input stays preserved with this project.`);
     res.json({
       files,
       summary: String(parsed.summary || 'Project files reviewed by the free OpenRouter model.').slice(0, 1200),
@@ -259,7 +277,7 @@ app.post('/api/organize', async (req, res, next) => {
       startCommand: String(parsed.startCommand || '').slice(0, 300),
       publishPath: String(parsed.publishPath || (parsed.deployType === 'static_site' && !parsed.buildCommand ? '.' : 'dist')).slice(0, 200),
       testCommand: String(parsed.testCommand || '').slice(0, 300),
-      notes: Array.isArray(parsed.notes) ? parsed.notes.slice(0, 12).map((n) => String(n).slice(0, 400)) : [],
+      notes,
     });
   } catch (error) { next(error); }
 });
@@ -300,8 +318,8 @@ function inspectProject(files) {
       findings.push({ severity: 'error', message: `Possible live secret detected in ${filePath}; remove it before sending or committing this file.` });
     }
   }
-  if (Object.keys(files).length > 300) findings.push({ severity: 'error', message: 'Project has more than 300 files.' });
-  if (totalBytes > 3_000_000) findings.push({ severity: 'error', message: 'Project exceeds the 3 MB total file limit.' });
+  if (Object.keys(files).length > MAX_PROJECT_FILE_COUNT) findings.push({ severity: 'error', message: `Project has more than ${MAX_PROJECT_FILE_COUNT.toLocaleString()} files.` });
+  if (totalBytes > MAX_PROJECT_BYTES) findings.push({ severity: 'error', message: `Project exceeds the ${Math.floor(MAX_PROJECT_BYTES / (1024 * 1024))} MB total file limit.` });
 
   let pkg = null;
   if (files['package.json']) {
@@ -537,8 +555,13 @@ app.post('/api/github/import', async (req, res, next) => {
     const { data: treeData } = await githubRequest(token, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(ref.object.sha)}?recursive=1`);
     if (treeData.truncated) throw httpError('This repository is too large to import in one pass. Use its ZIP download and keep source files under the project limit.', 413);
     const ignored = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.venv', 'vendor', '__pycache__']);
-    const blobs = (treeData.tree || []).filter((entry) => entry.type === 'blob' && entry.size <= 750_000 && validateRelativePath(entry.path) && !entry.path.split('/').some((part) => ignored.has(part.toLowerCase()))).slice(0, 301);
-    if (blobs.length > 300) throw httpError('Repository has more than 300 importable source files. Reduce generated/dependency content and retry.', 413);
+    const allBlobs = (treeData.tree || []).filter((entry) => entry.type === 'blob' && validateRelativePath(entry.path) && !entry.path.split('/').some((part) => ignored.has(part.toLowerCase())));
+    if (allBlobs.length > MAX_PROJECT_FILE_COUNT) throw httpError(`Repository has more than ${MAX_PROJECT_FILE_COUNT.toLocaleString()} importable files. Remove generated/dependency content and retry.`, 413);
+    const oversized = allBlobs.find((entry) => Number(entry.size) > MAX_PROJECT_FILE_BYTES);
+    if (oversized) throw httpError(`${oversized.path} exceeds the ${Math.floor(MAX_PROJECT_FILE_BYTES / (1024 * 1024))} MB per-file limit. Nothing was silently truncated.`, 413);
+    const declaredTotal = allBlobs.reduce((sum, entry) => sum + (Number(entry.size) || 0), 0);
+    if (declaredTotal > MAX_PROJECT_BYTES) throw httpError(`Repository source exceeds the ${Math.floor(MAX_PROJECT_BYTES / (1024 * 1024))} MB import limit. Remove generated files or import a smaller branch.`, 413);
+    const blobs = allBlobs;
     const files = {};
     let totalBytes = 0;
     let skipped = (treeData.tree || []).length - blobs.length;
@@ -553,9 +576,8 @@ app.post('/api/github/import', async (req, res, next) => {
         const extension = entry.path.split('.').at(-1)?.toLowerCase();
         const mime = BINARY_MIME[extension];
         if (mime) {
-          if (bytes.length > 750_000) { skipped += 1; continue; }
           totalBytes += bytes.length;
-          if (totalBytes > 3_000_000) throw httpError('Repository source exceeds the 3 MB total file limit. Use a smaller branch or remove generated files.', 413);
+          if (totalBytes > MAX_PROJECT_BYTES) throw httpError(`Repository source exceeds the ${Math.floor(MAX_PROJECT_BYTES / (1024 * 1024))} MB total file limit.`, 413);
           files[entry.path] = encodeBinaryAsset(bytes, mime);
           continue;
         }
@@ -565,7 +587,7 @@ app.post('/api/github/import', async (req, res, next) => {
         catch { skipped += 1; continue; }
         if (containsPossibleSecret(text)) throw httpError(`A possible live credential is present in ${entry.path}. Remove or rotate it before importing.`, 422);
         totalBytes += bytes.length;
-        if (totalBytes > 3_000_000) throw httpError('Repository source exceeds the 3 MB total file limit. Use a smaller branch or remove generated files.', 413);
+        if (totalBytes > MAX_PROJECT_BYTES) throw httpError(`Repository source exceeds the ${Math.floor(MAX_PROJECT_BYTES / (1024 * 1024))} MB total file limit.`, 413);
         files[entry.path] = text;
       }
     });
@@ -1090,6 +1112,28 @@ app.post('/api/settings/github-token', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.post('/api/settings/render-token', async (req, res, next) => {
+  try {
+    const renderToken = String(req.body?.renderToken || '').trim();
+    const ownerId = String(req.body?.ownerId || '').trim();
+    const serviceId = process.env.STACKPILOT_SERVICE_ID || process.env.RENDER_SERVICE_ID || '';
+    if (!renderToken) throw httpError('Enter a Render API key to save it securely.');
+    if (renderToken.length > 2000) throw httpError('The Render API key is too long.');
+    if (ownerId.length > 200) throw httpError('The Render owner ID is too long.');
+    if (!serviceId) throw httpError('The StackPilot Render service ID is not configured.');
+
+    // Validate the supplied key before writing it back into this service's secret environment.
+    await renderRequest(renderToken, '/services?limit=1');
+    const envUpdates = [['RENDER_API_TOKEN', renderToken]];
+    if (ownerId) envUpdates.push(['RENDER_OWNER_ID', ownerId]);
+    await Promise.all(envUpdates.map(([key, value]) => renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/env-vars/${encodeURIComponent(key)}`, { method: 'PUT', body: JSON.stringify({ value }) })));
+    const deploy = await renderRequest(renderToken, `/services/${encodeURIComponent(serviceId)}/deploys`, { method: 'POST', body: JSON.stringify({ clearCache: 'do_not_clear' }) });
+    process.env.RENDER_API_TOKEN = renderToken;
+    if (ownerId) process.env.RENDER_OWNER_ID = ownerId;
+    res.json({ ok: true, ownerIdSaved: Boolean(ownerId), deployId: deploy.id || '', message: 'Render API key saved as a StackPilot Render secret. A service restart has been queued.' });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/settings/openrouter-keys', async (req, res, next) => {
   try {
     const key1 = String(req.body?.key1 || '').trim();
@@ -1180,10 +1224,11 @@ app.post('/api/jobs', async (req, res, next) => {
     };
     if (!credentials.githubToken) throw httpError('Add a GitHub token override in this project’s Deploy & Render tab or configure GITHUB_TOKEN on the StackPilot server.');
     const rawInput = typeof project.rawInput === 'string' ? project.rawInput : '';
-    const sourceFiles = project.files && typeof project.files === 'object' ? project.files : {};
+    const rawFiles = project.files && typeof project.files === 'object' && Object.keys(project.files).length ? project.files : {};
+    const sourceFiles = Object.keys(rawFiles).length ? normalizeFiles(rawFiles) : {};
     if (!rawInput.trim() && !Object.keys(sourceFiles).length) throw httpError('Paste a code dump, import a ZIP, or add project files before starting.');
-    if (rawInput.trim() && !credentials.openRouterKeys.length) throw httpError('Add an OpenRouter key override in this project’s Deploy & Render tab or configure a workspace key in Settings.');
-    if (rawInput.length > 40_000) throw httpError('Keep the brief or code dump under 40,000 characters for the free-model context budget.');
+    if (rawInput.length > MAX_RAW_INPUT_CHARS) throw httpError(`Paste input is limited to ${MAX_RAW_INPUT_CHARS.toLocaleString()} characters. Use ZIP or GitHub import for larger files.`);
+    if (rawInput.trim() && !credentials.openRouterKeys.length && !Object.keys(sourceFiles).length) throw httpError('Add an OpenRouter key override in this project’s Deploy & Render tab or configure a workspace key in Settings.');
     const jobId = randomUUID();
     const job = {
       id: jobId, projectId, name, status: 'queued', activeAgent: 'StackPilot orchestrator',
@@ -1228,14 +1273,30 @@ async function runBackgroundJob(job, ctx) {
   let repairs = 0;
   try {
     job.status = 'running';
-    jobStep(job, 'organize', p.rawInput.trim() ? 'running' : 'done', 'Project architect', p.rawInput.trim() ? 'Reading the dump and assembling a runnable project structure.' : 'Starting from the saved project files.');
+    jobStep(job, 'organize', p.rawInput.trim() ? 'running' : 'done', 'Project architect', p.rawInput.trim() ? 'Keeping the full project input; the free-model context is bounded.' : 'Starting from the saved project files.');
     if (p.rawInput.trim()) {
-      const organized = await internalPost('/api/organize', { input: p.rawInput, files, projectName: p.name, apiKeys: creds.openRouterKeys, model: ctx.model });
-      files = { ...files, ...(organized.files || {}) };
-      Object.assign(p, organized, { files });
-      appendJobLog(job, `Free-model architect reviewed the project · ${organized.stack || 'stack identified'}.`, 'success', 'OpenRouter architect');
-      (organized.notes || []).forEach((note) => appendJobLog(job, note, 'warning', 'Project architect'));
-      patchJob(job, { files, activeFile: Object.keys(files).sort()[0] || '', summary: organized.summary || '', stack: organized.stack || '', serviceType: organized.deployType || p.serviceType, runtime: organized.runtime || p.runtime, buildCommand: organized.buildCommand || p.buildCommand, startCommand: organized.startCommand || p.startCommand, publishPath: organized.publishPath || p.publishPath, rawInput: p.rawInput });
+      const sourceTextBytes = Object.values(files).reduce((sum, content) => sum + (isBinaryAsset(content) ? 0 : Buffer.byteLength(content, 'utf8')), 0);
+      if (!creds.openRouterKeys.length) {
+        appendJobLog(job, 'No OpenRouter key is available. The full request and source files stay in the project; organization was skipped.', 'warning', 'Project architect');
+        patchJob(job, { files, activeFile: Object.keys(files).sort()[0] || '', rawInput: p.rawInput });
+      } else if (sourceTextBytes > MAX_ORGANIZER_SOURCE_BYTES) {
+        appendJobLog(job, `The project has ${sourceTextBytes.toLocaleString()} bytes of text source, above the free-model organize context. Full files and input are preserved; organization was skipped rather than sending a partial source tree.`, 'warning', 'Project architect');
+        patchJob(job, { files, activeFile: Object.keys(files).sort()[0] || '', rawInput: p.rawInput });
+      } else {
+        const modelFiles = Object.fromEntries(Object.entries(files).filter(([, content]) => !isBinaryAsset(content)));
+        const organized = await internalPost('/api/organize', { input: p.rawInput, files: modelFiles, projectName: p.name, apiKeys: creds.openRouterKeys, model: ctx.model });
+        if (organized.skipped) {
+          appendJobLog(job, 'Free-model organization was skipped to avoid sending a partial source tree. The full request and files remain preserved.', 'warning', 'Project architect');
+          (organized.notes || []).forEach((note) => appendJobLog(job, note, 'warning', 'Project architect'));
+          patchJob(job, { files, activeFile: Object.keys(files).sort()[0] || '', rawInput: p.rawInput });
+        } else {
+          files = { ...files, ...(organized.files || {}) };
+          Object.assign(p, organized, { files });
+          appendJobLog(job, `Free-model architect reviewed the project · ${organized.stack || 'stack identified'}.`, 'success', 'OpenRouter architect');
+          (organized.notes || []).forEach((note) => appendJobLog(job, note, 'warning', 'Project architect'));
+          patchJob(job, { files, activeFile: Object.keys(files).sort()[0] || '', summary: organized.summary || '', stack: organized.stack || '', serviceType: organized.deployType || p.serviceType, runtime: organized.runtime || p.runtime, buildCommand: organized.buildCommand || p.buildCommand, startCommand: organized.startCommand || p.startCommand, publishPath: organized.publishPath || p.publishPath, rawInput: p.rawInput });
+        }
+      }
     } else appendJobLog(job, 'Using the current project file tree.', 'info', 'Project architect');
     job.steps.organize = 'done';
 
